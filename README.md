@@ -1,26 +1,81 @@
-# new-project template
+# faktspense
 
-Minimal skeleton for starting a Claude Code–ready project. Copy it, fill in the stubs, start working.
+CLI tool that extracts invoice data from PDF files and imports them as expenses into [Fakturoid.cz](https://www.fakturoid.cz/) via the v3 API.
 
-Rationale and the "rule of three" for what to grow inside `.claude/` later: [project-templates pattern](https://belgor.github.io/pawok/claude-code/patterns/project-templates/).
+## How it works
 
-## Use
-
-```bash
-cp -r <template-source>/new-project /path/to/my-new-project
-cd /path/to/my-new-project
-git init
+```
+extract invoice.pdf  →  review/edit export.json  →  import export.json
 ```
 
-Then:
+1. **Extract** — renders PDF pages, sends to Claude API, writes structured data to `export.json`
+2. **Review** — open `export.json` in any editor, fix any extraction errors
+3. **Import** — reads `export.json`, matches vendors by IČO, creates expenses in Fakturoid with the original PDF attached
 
-1. Open `CLAUDE.md`, replace `<PROJECT_NAME>`, fill in each section. Delete sections you don't need.
-2. Extend `.gitignore` for your stack — it only covers the Claude-specific entry.
-3. Delete this `README.md` (or replace with your project's real README).
+## Requirements
 
-## Post-copy checklist
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/)
+- Fakturoid account with OAuth2 app (Client Credentials)
+- Anthropic API key
 
-- [ ] `CLAUDE.md` filled in (scope, stack, commands, hard rules)
-- [ ] `.gitignore` extended for stack
-- [ ] First real task attempted — let friction drive `.claude/` additions
-- [ ] After ~1 week: audit `.claude/`, delete unused, promote 3×-repeated patterns
+## Setup
+
+```bash
+git clone https://github.com/Belgor/faktspense.git
+cd faktspense
+uv sync
+```
+
+Set environment variables:
+
+```bash
+export FAKTUROID_CLIENT_ID=...
+export FAKTUROID_CLIENT_SECRET=...
+export FAKTUROID_SLUG=...          # your Fakturoid account slug
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## Usage
+
+```bash
+# Extract one PDF
+faktspense extract invoice.pdf
+
+# Extract all PDFs in a directory
+faktspense extract invoices/
+
+# Review and edit export.json, then import
+faktspense import export.json
+
+# Preview without writing to Fakturoid
+faktspense import export.json --dry-run
+
+# Skip vendor confirmation prompts (bulk import)
+faktspense import export.json --auto-create-subjects
+
+# Fail if vendor not found (strict mode)
+faktspense import export.json --no-create
+
+# Show import status
+faktspense status export.json
+```
+
+## Vendor matching
+
+When a vendor IČO is not found among existing Fakturoid subjects, the tool pauses and asks:
+
+```
+⚠  Vendor not found in Fakturoid
+   Extracted:  ACME s.r.o.   IČO: 12345678
+
+   [1] Create new subject from extracted data
+   [2] Map to existing subject
+   [3] Skip this invoice
+```
+
+Use `--auto-create-subjects` to skip this prompt in batch workflows.
+
+## Duplicate protection
+
+Each invoice is tracked in `export.json` with its Fakturoid `expense_id` and `imported_at` timestamp. Re-running import on an already-imported invoice raises an error rather than creating a duplicate.
