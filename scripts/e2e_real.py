@@ -6,11 +6,17 @@ folder (default: ``test_data_real/``) using real Anthropic and Fakturoid APIs.
 Not a pytest test — invoked directly. Kept outside ``tests/`` so ``uv run pytest``
 never hits the real APIs.
 
-Env vars required (TEST_-prefixed so they can't be confused with prod creds):
+Credentials are provided as sbx sandbox secrets and injected into this
+sandbox as TEST_-prefixed env vars (the prefix keeps them lexically
+distinct from the unprefixed production vars the CLI reads):
+
     TEST_FAKTUROID_CLIENT_ID
     TEST_FAKTUROID_CLIENT_SECRET
     TEST_FAKTUROID_SLUG           (must be a dedicated test account)
     TEST_ANTHROPIC_API_KEY
+
+Set on the host with ``sbx secret set <sandbox-name> <NAME> -t "..."``;
+restart the sandbox to pick up newly-added or rotated secrets.
 
 Usage:
     uv run python scripts/e2e_real.py
@@ -54,8 +60,8 @@ from fakturoid_naklady.pipeline import (  # noqa: E402
     VendorPromptAction,
 )
 
-# Credentials for the Fakturoid TEST account are stored as sbx secrets with a
-# TEST_ prefix so they can't be confused with production env vars.
+# Credentials come from sbx sandbox secrets, injected as TEST_-prefixed env
+# vars at sandbox startup. The prefix keeps them distinct from production vars.
 ENV_PREFIX = "TEST_"
 REQUIRED_ENV = (
     f"{ENV_PREFIX}FAKTUROID_CLIENT_ID",

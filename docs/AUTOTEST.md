@@ -11,27 +11,30 @@ pipeline against live services.
 ## Prerequisites
 
 A **dedicated Fakturoid test account** (Fakturoid has no sandbox — use a
-separate real account you don't mind filling with test data) and the
-`TEST_`-prefixed env vars below. The prefix is deliberate: it keeps the
-test-account credentials lexically distinct from the unprefixed production
-credentials the CLI reads, so neither can be invoked with the other's keys.
+separate real account you don't mind filling with test data).
+
+Credentials are provided as **`sbx` sandbox secrets**, not plain
+environment exports. The script is designed to run inside the sandbox
+where `sbx` injects them automatically as `TEST_`-prefixed env vars.
+The prefix is deliberate: it keeps test-account credentials lexically
+distinct from the unprefixed production credentials the CLI reads, so
+neither can be invoked with the other's keys.
+
+Set them once on the host:
 
 ```bash
-export TEST_FAKTUROID_CLIENT_ID=...
-export TEST_FAKTUROID_CLIENT_SECRET=...
-export TEST_FAKTUROID_SLUG=...              # test account slug
-export TEST_ANTHROPIC_API_KEY=sk-ant-...
-```
-
-In `sbx`-based setups, store these as sandbox secrets so they're injected
-into the sandbox automatically:
-
-```bash
-sbx secret set <sandbox-name> TEST_FAKTUROID_CLIENT_ID -t "..."
+sbx secret set <sandbox-name> TEST_FAKTUROID_CLIENT_ID     -t "..."
 sbx secret set <sandbox-name> TEST_FAKTUROID_CLIENT_SECRET -t "..."
-sbx secret set <sandbox-name> TEST_FAKTUROID_SLUG -t "..."
-sbx secret set <sandbox-name> TEST_ANTHROPIC_API_KEY -t "sk-ant-..."
+sbx secret set <sandbox-name> TEST_FAKTUROID_SLUG          -t "..."
+sbx secret set <sandbox-name> TEST_ANTHROPIC_API_KEY       -t "sk-ant-..."
+
+# Verify:
+sbx secret list
 ```
+
+Secrets are injected at sandbox startup. After adding or rotating a
+secret, restart the sandbox so the new values reach the script's
+environment — an already-running session will not see them.
 
 Input PDFs live in `test_data_real/` (gitignored).
 
