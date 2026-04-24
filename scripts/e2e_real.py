@@ -6,11 +6,11 @@ folder (default: ``test_data_real/``) using real Anthropic and Fakturoid APIs.
 Not a pytest test — invoked directly. Kept outside ``tests/`` so ``uv run pytest``
 never hits the real APIs.
 
-Env vars required (same as the CLI):
-    FAKTUROID_CLIENT_ID
-    FAKTUROID_CLIENT_SECRET
-    FAKTUROID_SLUG           (must be a dedicated test account)
-    ANTHROPIC_API_KEY
+Env vars required (TEST_-prefixed so they can't be confused with prod creds):
+    TEST_FAKTUROID_CLIENT_ID
+    TEST_FAKTUROID_CLIENT_SECRET
+    TEST_FAKTUROID_SLUG           (must be a dedicated test account)
+    TEST_ANTHROPIC_API_KEY
 
 Usage:
     uv run python scripts/e2e_real.py
@@ -54,11 +54,14 @@ from fakturoid_naklady.pipeline import (  # noqa: E402
     VendorPromptAction,
 )
 
+# Credentials for the Fakturoid TEST account are stored as sbx secrets with a
+# TEST_ prefix so they can't be confused with production env vars.
+ENV_PREFIX = "TEST_"
 REQUIRED_ENV = (
-    "FAKTUROID_CLIENT_ID",
-    "FAKTUROID_CLIENT_SECRET",
-    "FAKTUROID_SLUG",
-    "ANTHROPIC_API_KEY",
+    f"{ENV_PREFIX}FAKTUROID_CLIENT_ID",
+    f"{ENV_PREFIX}FAKTUROID_CLIENT_SECRET",
+    f"{ENV_PREFIX}FAKTUROID_SLUG",
+    f"{ENV_PREFIX}ANTHROPIC_API_KEY",
 )
 
 
@@ -143,13 +146,13 @@ def _require_env() -> None:
 def _build_fakturoid() -> tuple[FakturoidClient, httpx.Client]:
     http = httpx.Client(timeout=60.0)
     tp = OAuth2TokenProvider(
-        client_id=os.environ["FAKTUROID_CLIENT_ID"],
-        client_secret=os.environ["FAKTUROID_CLIENT_SECRET"],
+        client_id=os.environ[f"{ENV_PREFIX}FAKTUROID_CLIENT_ID"],
+        client_secret=os.environ[f"{ENV_PREFIX}FAKTUROID_CLIENT_SECRET"],
         http=http,
         user_agent=USER_AGENT,
     )
     return FakturoidClient(
-        slug=os.environ["FAKTUROID_SLUG"],
+        slug=os.environ[f"{ENV_PREFIX}FAKTUROID_SLUG"],
         http=http,
         token_provider=tp,
     ), http
@@ -158,7 +161,11 @@ def _build_fakturoid() -> tuple[FakturoidClient, httpx.Client]:
 def _build_extractor() -> ClaudeExtractor:
     import anthropic
 
-    return ClaudeExtractor(client=anthropic.Anthropic())
+    # Pass the key explicitly — the SDK's default reads ANTHROPIC_API_KEY, which
+    # we deliberately do NOT use (to avoid accidental production-key spend here).
+    return ClaudeExtractor(
+        client=anthropic.Anthropic(api_key=os.environ[f"{ENV_PREFIX}ANTHROPIC_API_KEY"])
+    )
 
 
 def _auto_create_prompt(
