@@ -92,6 +92,10 @@ class SubjectStore:
 
     # ------- lookup -------
 
+    def loaded_subject_ids(self) -> set[int]:
+        """Return ids of all currently-loaded subjects (loads from cache/API if needed)."""
+        return {int(s["id"]) for s in self._ensure_loaded() if s.get("id") is not None}
+
     def find_by_ico(self, ico: str) -> dict[str, Any] | None:
         subjects = self._ensure_loaded()
         match = _match_ico(subjects, ico)

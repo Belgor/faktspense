@@ -9,3 +9,7 @@ dist/
 build/
 *.egg-info/
 export.json
+test_data_real/
+.env
+.env.*
+!.env.example
