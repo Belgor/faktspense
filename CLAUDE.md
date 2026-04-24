@@ -95,7 +95,7 @@ The `id` field is `sha256(pdf_bytes)` — used as both dedup key and Fakturoid `
 ## Hard rules
 
 - **Never** load .env files — credentials come from env vars only.
-- **Always** include `User-Agent: fakturoid-naklady/0.1 (ai.claude@brehovsky.cz)` on every Fakturoid request. Omitting it returns 400.
+- **Always** include `User-Agent: faktspense/0.1` on every Fakturoid request. Omitting it returns 400. Do not embed email or other PII in the header.
 - **Never** POST to Fakturoid if `fakturoid.status == "imported"` — error out with expense_id and imported_at.
 - **Always** attach the original PDF as base64 `data:application/pdf;base64,...` in the `attachments` array when creating the expense.
 - **Never** import without setting `custom_id` (= record `id`) — this is the idempotency key.
