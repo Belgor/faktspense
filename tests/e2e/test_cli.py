@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from typer.testing import CliRunner
 
 from fakturoid_naklady import cli as cli_mod
 from fakturoid_naklady.cli import app
+from fakturoid_naklady.export import ExportStore
 from fakturoid_naklady.extraction.claude import ClaudeExtractor
 from tests.conftest import StubAnthropic
 
@@ -45,31 +47,36 @@ def stub_extractor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_mod, "_build_extractor", _build)
 
 
-def test_extract_writes_export_json(
+def _expected_sidecar(out_dir: Path, pdf: Path) -> Path:
+    sha8 = hashlib.sha256(pdf.read_bytes()).hexdigest()[:8]
+    return out_dir / f"{pdf.stem}_{sha8}.json"
+
+
+def test_extract_writes_per_invoice_sidecar(
     tmp_path: Path, sample_pdf: Path, fakturoid_env: None, stub_extractor: None
 ) -> None:
     runner = CliRunner()
-    out = tmp_path / "export.json"
+    out = tmp_path / "out"
     result = runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
     assert result.exit_code == 0, result.output
-    assert out.exists()
-    data = json.loads(out.read_text())
-    assert len(data["invoices"]) == 1
-    rec = data["invoices"][0]
+
+    sidecar = _expected_sidecar(out, sample_pdf)
+    assert sidecar.exists(), list(out.iterdir())
+    rec = json.loads(sidecar.read_text())
     assert rec["invoice_number"] == "2024-0042"
     assert rec["fakturoid"]["status"] == "pending"
-    assert len(rec["id"]) == 64
+    assert len(rec["id"]) == 64  # full sha256 retained inside
 
 
 def test_extract_is_idempotent(
     tmp_path: Path, sample_pdf: Path, fakturoid_env: None, stub_extractor: None
 ) -> None:
     runner = CliRunner()
-    out = tmp_path / "export.json"
+    out = tmp_path / "out"
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
-    data = json.loads(out.read_text())
-    assert len(data["invoices"]) == 1
+    files = sorted(p.name for p in out.glob("*.json"))
+    assert len(files) == 1
 
 
 def test_import_dry_run_does_not_post(
@@ -81,7 +88,7 @@ def test_import_dry_run_does_not_post(
     patched_default_cache_path: Path,
 ) -> None:
     runner = CliRunner()
-    out = tmp_path / "export.json"
+    out = tmp_path / "out"
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
 
     httpx_mock.add_response(
@@ -99,7 +106,8 @@ def test_import_dry_run_does_not_post(
 
     result = runner.invoke(app, ["import", str(out), "--dry-run"])
     assert result.exit_code == 0, result.output
-    rec = json.loads(out.read_text())["invoices"][0]
+
+    rec = json.loads(_expected_sidecar(out, sample_pdf).read_text())
     assert rec["fakturoid"]["status"] == "pending"
     assert rec["fakturoid"]["expense_id"] is None
     assert rec["fakturoid"]["subject_id"] == 7
@@ -116,7 +124,7 @@ def test_import_live_then_blocks_reimport(
     patched_default_cache_path: Path,
 ) -> None:
     runner = CliRunner()
-    out = tmp_path / "export.json"
+    out = tmp_path / "out"
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
 
     httpx_mock.add_response(
@@ -140,7 +148,7 @@ def test_import_live_then_blocks_reimport(
 
     result = runner.invoke(app, ["import", str(out)])
     assert result.exit_code == 0, result.output
-    rec = json.loads(out.read_text())["invoices"][0]
+    rec = json.loads(_expected_sidecar(out, sample_pdf).read_text())
     assert rec["fakturoid"]["status"] == "imported"
     assert rec["fakturoid"]["expense_id"] == 999
 
@@ -155,8 +163,33 @@ def test_status_command_runs(
     tmp_path: Path, sample_pdf: Path, fakturoid_env: None, stub_extractor: None
 ) -> None:
     runner = CliRunner()
-    out = tmp_path / "export.json"
+    out = tmp_path / "out"
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
     result = runner.invoke(app, ["status", str(out)])
     assert result.exit_code == 0
     assert "2024-0042" in result.output
+
+
+def test_extract_re_extracts_when_pdf_content_changes(
+    tmp_path: Path, sample_pdf: Path, fakturoid_env: None, stub_extractor: None
+) -> None:
+    runner = CliRunner()
+    out = tmp_path / "out"
+    runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
+
+    store = ExportStore(out)
+    [first] = store.records()
+    old_path = store.path_for(first)
+    assert old_path.exists()
+
+    # Mutate the PDF bytes — appending changes its sha256 but most viewers
+    # still treat it as a valid PDF (the trailer comes before the appended bytes).
+    sample_pdf.write_bytes(sample_pdf.read_bytes() + b"\n%% touched\n")
+
+    runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
+
+    files = sorted(p.name for p in out.glob("*.json"))
+    assert len(files) == 1
+    assert not old_path.exists()  # stale sidecar removed
+    [updated] = ExportStore(out).records()
+    assert updated.id != first.id

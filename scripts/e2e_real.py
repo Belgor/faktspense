@@ -6,6 +6,12 @@ folder (default: ``test_data_real/``) using real Anthropic and Fakturoid APIs.
 Not a pytest test — invoked directly. Kept outside ``tests/`` so ``uv run pytest``
 never hits the real APIs.
 
+Persistence goes through the production :class:`ExportStore`, so this script
+exercises the same per-invoice sidecar layout the CLI uses. Each PDF gets a
+``<safe_pdf_stem>_<sha8>.json`` sidecar inside ``--work-dir`` (default
+``test_data_real/_faktspense_run/``); the file's full ``id`` (sha256) is
+checked on every re-run to detect content changes and re-extract.
+
 Credentials are provided as sbx sandbox secrets and injected into this
 sandbox as TEST_-prefixed env vars (the prefix keeps them lexically
 distinct from the unprefixed production vars the CLI reads):
@@ -21,13 +27,12 @@ restart the sandbox to pick up newly-added or rotated secrets.
 Usage:
     uv run python scripts/e2e_real.py
     uv run python scripts/e2e_real.py --cleanup        # delete created expenses+subjects
-    uv run python scripts/e2e_real.py --skip-extract   # reuse existing export.json
+    uv run python scripts/e2e_real.py --skip-extract   # reuse existing sidecars
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import sys
 from dataclasses import dataclass, field
@@ -42,7 +47,7 @@ import httpx
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from fakturoid_naklady import export as export_mod  # noqa: E402
+from fakturoid_naklady.export import ExportStore, sha256_file  # noqa: E402
 from fakturoid_naklady.extraction.claude import ClaudeExtractor  # noqa: E402
 from fakturoid_naklady.extraction.renderer import render_pdf  # noqa: E402
 from fakturoid_naklady.fakturoid.auth import OAuth2TokenProvider  # noqa: E402
@@ -138,10 +143,6 @@ class Report:
 # ----------------------------------------------------------------------------
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _require_env() -> None:
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
@@ -186,7 +187,7 @@ def _auto_create_prompt(
 # ----------------------------------------------------------------------------
 
 
-def phase_extract(pdf_dir: Path, export_path: Path, report: Report) -> None:
+def phase_extract(pdf_dir: Path, store: ExportStore, report: Report) -> None:
     print(f"\n[extract] scanning {pdf_dir}")
     pdfs = sorted(p for p in pdf_dir.glob("*.pdf") if p.is_file())
     if not pdfs:
@@ -194,18 +195,17 @@ def phase_extract(pdf_dir: Path, export_path: Path, report: Report) -> None:
         sys.exit(1)
 
     extractor = _build_extractor()
-    export = export_mod.load(export_path)
 
     for pdf in pdfs:
-        invoice_id = _sha256_file(pdf)
-        existing = export_mod.find_by_id(export, invoice_id)
+        invoice_id = sha256_file(pdf)
+        existing = store.find_by_id(invoice_id)
         if existing is not None:
             report.records[invoice_id] = RecordReport(
                 invoice_number=existing.invoice_number,
                 pdf_name=pdf.name,
                 extracted=True,
             )
-            print(f"  skip {pdf.name} — already extracted")
+            print(f"  skip {pdf.name} — already extracted (sidecar matches sha256)")
             continue
 
         print(f"  extract {pdf.name}")
@@ -226,38 +226,36 @@ def phase_extract(pdf_dir: Path, export_path: Path, report: Report) -> None:
             extracted_at=datetime.now(UTC),
             extracted=extracted,
         )
-        export_mod.upsert(export, record)
-        export_mod.save(export_path, export)
+        store.upsert(record)
         report.records[invoice_id] = RecordReport(
             invoice_number=record.invoice_number,
             pdf_name=pdf.name,
             extracted=True,
         )
 
-    print(f"[extract] wrote {export_path}")
+    print(f"[extract] sidecars in {store.root}")
 
 
 def phase_import(
-    export_path: Path,
+    store: ExportStore,
     report: Report,
     client: FakturoidClient,
     subjects: SubjectStore,
 ) -> None:
-    print(f"\n[import] {export_path}")
+    print(f"\n[import] {store.root}")
 
     # Snapshot existing subject ids so cleanup can tell ours from theirs.
     pre_existing_subject_ids = subjects.loaded_subject_ids()
 
-    export = export_mod.load(export_path)
     runner = ImportRunner(
         client=client,
         subjects=subjects,
-        pdf_root=export_path.parent,
+        pdf_root=store.root,
         vendor_prompt=_auto_create_prompt,
     )
     flags = ImportFlags(auto_create_subjects=True)
 
-    for record in export.invoices:
+    for record in store.records():
         r = report.records.setdefault(
             record.id,
             RecordReport(
@@ -276,19 +274,16 @@ def phase_import(
             outcome = runner.run_one(record, flags)
         except Exception as e:
             r.hard_error = f"import failed: {e}"
-            export_mod.update_status(export, record.id, status="error", error=str(e))
-            export_mod.save(export_path, export)
+            store.update_status(record.id, status="error", error=str(e))
             continue
 
-        export_mod.update_status(
-            export,
+        store.update_status(
             record.id,
             status=outcome.status,
             subject_id=outcome.subject_id,
             expense_id=outcome.expense_id,
             imported_at=outcome.imported_at,
         )
-        export_mod.save(export_path, export)
         if outcome.status == "imported":
             r.imported = True
             r.expense_id = outcome.expense_id
@@ -298,13 +293,12 @@ def phase_import(
 
 
 def phase_validate(
-    export_path: Path,
+    store: ExportStore,
     report: Report,
     client: FakturoidClient,
 ) -> None:
     print("\n[validate] fetching each created expense back from Fakturoid")
-    export = export_mod.load(export_path)
-    for record in export.invoices:
+    for record in store.records():
         r = report.records.get(record.id)
         if r is None:
             continue
@@ -352,21 +346,20 @@ def phase_validate(
 
 
 def phase_idempotency(
-    export_path: Path,
+    store: ExportStore,
     report: Report,
     client: FakturoidClient,
     subjects: SubjectStore,
 ) -> None:
     print("\n[idempotency] re-running import — every record should be refused")
-    export = export_mod.load(export_path)
     runner = ImportRunner(
         client=client,
         subjects=subjects,
-        pdf_root=export_path.parent,
+        pdf_root=store.root,
         vendor_prompt=_auto_create_prompt,
     )
     flags = ImportFlags(auto_create_subjects=True)
-    for record in export.invoices:
+    for record in store.records():
         r = report.records.get(record.id)
         if r is None or not r.imported:
             continue
@@ -381,15 +374,14 @@ def phase_idempotency(
 
 
 def phase_cleanup(
-    export_path: Path,
+    store: ExportStore,
     report: Report,
     client: FakturoidClient,
 ) -> None:
     print("\n[cleanup] deleting created expenses + subjects")
-    export = export_mod.load(export_path)
 
     # Delete expenses first (they reference subjects).
-    for record in export.invoices:
+    for record in store.records():
         r = report.records.get(record.id)
         if r is None or r.expense_id is None:
             continue
@@ -440,7 +432,10 @@ def main() -> int:
         "--work-dir",
         type=Path,
         default=None,
-        help="Scratch dir for export.json + subject cache (default: <pdf-dir>/_run/).",
+        help=(
+            "Scratch dir for per-invoice sidecars + subject cache "
+            "(default: <pdf-dir>/_faktspense_run/)."
+        ),
     )
     parser.add_argument(
         "--cleanup",
@@ -459,20 +454,19 @@ def main() -> int:
         print(f"ERROR: {args.pdf_dir} is not a directory", file=sys.stderr)
         return 2
 
-    work_dir = args.work_dir or (args.pdf_dir / "_run")
+    work_dir = args.work_dir or (args.pdf_dir / "_faktspense_run")
     work_dir.mkdir(parents=True, exist_ok=True)
-    export_path = work_dir / "export.json"
-    subjects_cache = work_dir / "subjects_cache.json"
+    subjects_cache = work_dir / ".subjects_cache.json"
+    store = ExportStore(work_dir)
 
     report = Report(started_at=datetime.now(UTC))
 
     client, http = _build_fakturoid()
     try:
         if not args.skip_extract:
-            phase_extract(args.pdf_dir, export_path, report)
+            phase_extract(args.pdf_dir, store, report)
         else:
-            export = export_mod.load(export_path)
-            for rec in export.invoices:
+            for rec in store.records():
                 report.records.setdefault(
                     rec.id,
                     RecordReport(
@@ -488,14 +482,14 @@ def main() -> int:
         subjects = SubjectStore(client=client, cache_path=subjects_cache)
 
         if not args.skip_import:
-            phase_import(export_path, report, client, subjects)
+            phase_import(store, report, client, subjects)
         if not args.skip_validate:
-            phase_validate(export_path, report, client)
+            phase_validate(store, report, client)
         if not args.skip_idempotency:
-            phase_idempotency(export_path, report, client, subjects)
+            phase_idempotency(store, report, client, subjects)
 
         if args.cleanup:
-            phase_cleanup(export_path, report, client)
+            phase_cleanup(store, report, client)
     finally:
         http.close()
 

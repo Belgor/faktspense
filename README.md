@@ -5,14 +5,14 @@ CLI tool that extracts invoice data from PDF files and imports them as expenses 
 ## How it works
 
 ```
-extract invoice.pdf  →  review/edit export.json  →  import export.json
+extract invoice.pdf  →  review/edit ./export/<pdf>_<sha8>.json  →  import ./export/
 ```
 
-1. **Extract** — renders PDF pages, sends them to the Claude API, writes structured data to `export.json`.
-2. **Review** — open `export.json` in any editor and fix any extraction errors.
-3. **Import** — matches vendors by IČO, creates expenses in Fakturoid with the original PDF attached, and tracks state back into `export.json`.
+1. **Extract** — renders PDF pages, sends them to the Claude API, writes one JSON sidecar per PDF into the output directory (one file per invoice, named `<pdf_stem>_<sha8>.json`).
+2. **Review** — open the sidecars in any editor and fix any extraction errors.
+3. **Import** — matches vendors by IČO, creates expenses in Fakturoid with the original PDF attached, and updates each sidecar with the resulting `subject_id` / `expense_id` / `status`.
 
-Each invoice is keyed by `sha256(pdf_bytes)`, used as the Fakturoid `custom_id` for idempotency. Running import twice on the same PDF refuses to double-post.
+Each invoice is keyed by `sha256(pdf_bytes)` (full hash kept inside the sidecar; first 8 chars in the filename). The hash is used as the Fakturoid `custom_id` for idempotency, and on re-runs the tool detects a modified PDF (different hash) and re-extracts it — replacing the stale sidecar.
 
 ## Requirements
 
@@ -57,34 +57,34 @@ Create an API key at https://console.anthropic.com/ and export it as `ANTHROPIC_
 ## Usage
 
 ```bash
-# Extract one PDF (writes ./export.json by default)
+# Extract one PDF (writes one sidecar into ./export/ by default)
 faktspense extract invoice.pdf
 
 # Extract every *.pdf in a directory
 faktspense extract invoices/
 
-# Custom output path
-faktspense extract invoice.pdf --output my-batch.json
+# Custom output directory
+faktspense extract invoice.pdf --output ./my-batch/
 
-# Review: open export.json in any editor, fix any extraction errors.
+# Review: open the per-invoice JSON files in ./export/ in any editor, fix any errors.
 
 # Preview the payload without writing to Fakturoid
-faktspense import export.json --dry-run
+faktspense import ./export/ --dry-run
 
 # Import for real
-faktspense import export.json
+faktspense import ./export/
 
 # Skip the vendor-confirmation prompt (bulk mode — creates missing subjects silently)
-faktspense import export.json --auto-create-subjects
+faktspense import ./export/ --auto-create-subjects
 
 # Strict mode — fail if a vendor doesn't exist
-faktspense import export.json --no-create
+faktspense import ./export/ --no-create
 
 # Force a refresh of the local Fakturoid subjects cache
-faktspense import export.json --refresh-subjects
+faktspense import ./export/ --refresh-subjects
 
 # Status table
-faktspense status export.json
+faktspense status ./export/
 ```
 
 ## Vendor matching
@@ -111,7 +111,7 @@ Use `--refresh-subjects` to force a full re-fetch after vendors were added or ed
 
 ## Duplicate protection
 
-Each invoice is tracked in `export.json` with its Fakturoid `expense_id`, `imported_at`, and `status` (`pending` | `imported` | `error` | `skipped`). Re-running import on an already-imported invoice raises an error rather than creating a duplicate. Writes are atomic and flushed after each record, so killing the process mid-batch leaves `export.json` consistent.
+Each invoice is tracked in its own sidecar JSON with `expense_id`, `imported_at`, and `status` (`pending` | `imported` | `error` | `skipped`). Re-running import on an already-imported invoice raises an error rather than creating a duplicate. Each sidecar is written atomically (temp file + rename) immediately after every state change, so killing the process mid-batch leaves the directory consistent — already-imported invoices stay imported, the rest are still `pending`.
 
 ## Development
 
@@ -133,9 +133,9 @@ uv run ruff check . && uv run ruff format --check .
 
 **`429 Too Many Requests`.** Fakturoid limits to 100 requests/hour. The client respects `Retry-After` and retries once; for large batches, use `--auto-create-subjects` and/or enable the subject cache (it's on by default — one cache fill instead of N lookups).
 
-**Extraction got the vendor wrong.** Open `export.json` in an editor, fix the fields, and run `import`. The extracted values are inputs to `import`, not a fixed record — editing them is expected workflow.
+**Extraction got the vendor wrong.** Open the relevant `<pdf_stem>_<sha8>.json` sidecar, fix the fields, and run `import`. The extracted values are inputs to `import`, not a fixed record — editing them is expected workflow.
 
-**`already imported` error on re-import.** This is by design — it prevents duplicate expenses. To retry a specific record, edit its `fakturoid.status` back to `"pending"` in `export.json`.
+**`already imported` error on re-import.** This is by design — it prevents duplicate expenses. To retry a specific record, edit its `fakturoid.status` back to `"pending"` in the sidecar JSON.
 
 ## License
 

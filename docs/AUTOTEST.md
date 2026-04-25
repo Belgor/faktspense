@@ -47,16 +47,26 @@ uv run python scripts/e2e_real.py
 # Full run + delete everything the script created at the end:
 uv run python scripts/e2e_real.py --cleanup
 
-# Resume from a partial run (uses test_data_real/_run/export.json as-is):
+# Resume from a partial run (uses sidecars in test_data_real/_faktspense_run/ as-is):
 uv run python scripts/e2e_real.py --skip-extract
 
 # Validate an existing import without importing again:
 uv run python scripts/e2e_real.py --skip-extract --skip-import
 ```
 
-Scratch files land in `test_data_real/_run/`:
-- `export.json` — the usual review artifact, plus Fakturoid state per record
-- `subjects_cache.json` — isolated subject cache (does not touch `~/.cache/faktspense/`)
+Scratch files land in `test_data_real/_faktspense_run/`:
+- `<safe_pdf_stem>_<sha8>.json` — one sidecar per PDF, the same per-invoice
+  layout the production CLI writes. Extracted fields (editable) plus a
+  `fakturoid` block tracking `subject_id` / `expense_id` / `status` /
+  `imported_at`. The full sha256 lives in the sidecar's `id` field — on
+  re-runs the script compares it to the current PDF's sha256 and
+  re-extracts if the PDF has changed.
+- `.subjects_cache.json` — isolated subject cache (does not touch
+  `~/.cache/faktspense/`).
+
+Persistence goes through the production `ExportStore` class
+(`src/fakturoid_naklady/export.py`); the script does not implement its
+own per-record I/O.
 
 ## What the script asserts
 
@@ -79,7 +89,7 @@ Scratch files land in `test_data_real/_run/`:
 By default the script leaves the created expenses and subjects in place so you
 can eyeball them in the Fakturoid UI. Pass `--cleanup` to delete them at the end:
 
-- All expenses referenced by `export.json` are `DELETE`d.
+- All expenses referenced by the sidecars are `DELETE`d.
 - Subjects the script itself created (i.e. not present before the import phase)
   are `DELETE`d. Pre-existing subjects are never touched.
 

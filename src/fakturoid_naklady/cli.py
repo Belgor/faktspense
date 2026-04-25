@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import sys
 from datetime import UTC, datetime
@@ -15,7 +14,7 @@ from rich.console import Console
 from rich.prompt import IntPrompt
 from rich.table import Table
 
-from . import export as export_mod
+from .export import ExportStore, sha256_file
 from .extraction.claude import ClaudeExtractor
 from .extraction.renderer import render_pdf
 from .fakturoid.auth import OAuth2TokenProvider
@@ -55,10 +54,6 @@ def _iter_pdfs(path: Path) -> list[Path]:
     if path.is_dir():
         return sorted(p for p in path.glob("*.pdf") if p.is_file())
     raise typer.BadParameter(f"Not a PDF file or directory: {path}")
-
-
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _build_fakturoid() -> tuple[FakturoidClient, httpx.Client]:
@@ -113,25 +108,28 @@ def _vendor_prompt(
 @app.command()
 def extract(
     input_path: Path = typer.Argument(..., exists=True, help="PDF file or directory."),
-    output: Path = typer.Option(Path("export.json"), "--output", "-o", help="Path to export.json."),
+    output: Path = typer.Option(
+        Path("export"), "--output", "-o", help="Directory for per-invoice JSON sidecars."
+    ),
 ) -> None:
-    """Extract invoice data from PDF(s) and write/merge into export.json."""
+    """Extract invoice data from PDF(s); writes one JSON sidecar per PDF into ``output``."""
     pdfs = _iter_pdfs(input_path)
     if not pdfs:
         err_console.print("[red]No PDFs found.[/red]")
         raise typer.Exit(code=1)
 
     extractor = _build_extractor()
-    export = export_mod.load(output)
+    store = ExportStore(output)
 
     for pdf in pdfs:
-        invoice_id = _sha256_file(pdf)
-        existing = export_mod.find_by_id(export, invoice_id)
-        if existing is not None and existing.fakturoid.status == "imported":
-            console.print(
-                f"[yellow]skip[/yellow] {pdf.name} — already imported "
-                f"(expense_id={existing.fakturoid.expense_id})"
-            )
+        invoice_id = sha256_file(pdf)
+        existing = store.find_by_id(invoice_id)
+        if existing is not None:
+            if existing.fakturoid.status == "imported":
+                reason = f"already imported (expense_id={existing.fakturoid.expense_id})"
+            else:
+                reason = "already extracted"
+            console.print(f"[yellow]skip[/yellow] {pdf.name} — {reason}")
             continue
         console.print(f"[cyan]extract[/cyan] {pdf.name}")
         rendered = render_pdf(pdf)
@@ -142,29 +140,31 @@ def extract(
             extracted_at=datetime.now(UTC),
             extracted=extracted,
         )
-        export_mod.upsert(export, record)
-        export_mod.save(output, export)
+        store.upsert(record)
 
     console.print(f"[green]wrote[/green] {output}")
 
 
 @app.command("import")
 def import_cmd(
-    export_path: Path = typer.Argument(..., exists=True, help="Path to export.json."),
+    export_path: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True, help="Directory of invoice sidecars."
+    ),
     dry_run: bool = typer.Option(False, "--dry-run"),
     auto_create_subjects: bool = typer.Option(False, "--auto-create-subjects"),
     no_create: bool = typer.Option(False, "--no-create"),
     refresh_subjects: bool = typer.Option(False, "--refresh-subjects"),
 ) -> None:
-    """Import pending invoices from export.json into Fakturoid."""
+    """Import pending invoices from the sidecar directory into Fakturoid."""
     if auto_create_subjects and no_create:
         err_console.print(
             "[red]--auto-create-subjects and --no-create are mutually exclusive[/red]"
         )
         raise typer.Exit(code=2)
 
-    export = export_mod.load(export_path)
-    if not export.invoices:
+    store = ExportStore(export_path)
+    records = store.records()
+    if not records:
         console.print("Nothing to import.")
         return
 
@@ -174,7 +174,7 @@ def import_cmd(
         runner = ImportRunner(
             client=client,
             subjects=subjects,
-            pdf_root=export_path.parent,
+            pdf_root=export_path,
             vendor_prompt=_vendor_prompt,
         )
         flags = ImportFlags(
@@ -184,7 +184,7 @@ def import_cmd(
             refresh_subjects=refresh_subjects,
         )
 
-        for record in export.invoices:
+        for record in records:
             if record.fakturoid.status == "imported":
                 console.print(f"[yellow]skip[/yellow] {record.invoice_number} — already imported")
                 continue
@@ -192,23 +192,19 @@ def import_cmd(
                 outcome = runner.run_one(record, flags)
             except (AlreadyImportedError, VendorNotFoundError) as e:
                 err_console.print(f"[red]{record.invoice_number}:[/red] {e}")
-                export_mod.update_status(export, record.id, status="error", error=str(e))
-                export_mod.save(export_path, export)
+                store.update_status(record.id, status="error", error=str(e))
                 raise typer.Exit(code=1) from e
             except Exception as e:
-                export_mod.update_status(export, record.id, status="error", error=str(e))
-                export_mod.save(export_path, export)
+                store.update_status(record.id, status="error", error=str(e))
                 raise
 
-            export_mod.update_status(
-                export,
+            store.update_status(
                 record.id,
                 status=outcome.status,
                 subject_id=outcome.subject_id,
                 expense_id=outcome.expense_id,
                 imported_at=outcome.imported_at,
             )
-            export_mod.save(export_path, export)
             console.print(
                 f"[green]{outcome.status}[/green] {record.invoice_number}"
                 + (f" (expense_id={outcome.expense_id})" if outcome.expense_id else "")
@@ -219,10 +215,12 @@ def import_cmd(
 
 @app.command()
 def status(
-    export_path: Path = typer.Argument(..., exists=True, help="Path to export.json."),
+    export_path: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True, help="Directory of invoice sidecars."
+    ),
 ) -> None:
-    """Show a status table for the invoices in export.json."""
-    export = export_mod.load(export_path)
+    """Show a status table for the invoices in the sidecar directory."""
+    store = ExportStore(export_path)
     table = Table(title=f"faktspense — {export_path}")
     table.add_column("Invoice")
     table.add_column("Vendor")
@@ -230,7 +228,7 @@ def status(
     table.add_column("Total")
     table.add_column("Status")
     table.add_column("Expense ID")
-    for rec in export.invoices:
+    for rec in store.records():
         table.add_row(
             rec.invoice_number,
             rec.vendor.name,

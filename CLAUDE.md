@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **faktspense** — CLI tool that extracts structured invoice data from PDF files using the Claude API and imports them as expenses into [Fakturoid.cz](https://www.fakturoid.cz/) via the v3 REST API. Not a general-purpose Fakturoid client — scope is limited to expense (náklady) import.
 
-Two-step flow: `extract` → user reviews/edits `export.json` → `import`.
+Two-step flow: `extract` → user reviews/edits per-invoice JSON sidecars in the output dir → `import`.
 
 ## Stack
 
@@ -25,20 +25,20 @@ Two-step flow: `extract` → user reviews/edits `export.json` → `import`.
 # Install
 uv sync
 
-# Extract PDFs → export.json
+# Extract PDFs → ./export/<pdf_stem>_<sha8>.json (one sidecar per PDF)
 uv run faktspense extract invoice.pdf
 uv run faktspense extract invoices/                   # whole directory
-uv run faktspense extract invoice.pdf -o batch.json
+uv run faktspense extract invoice.pdf -o ./batch/
 
-# Import from export.json → Fakturoid
-uv run faktspense import export.json
-uv run faktspense import export.json --dry-run
-uv run faktspense import export.json --auto-create-subjects
-uv run faktspense import export.json --no-create
-uv run faktspense import export.json --refresh-subjects
+# Import from sidecar dir → Fakturoid
+uv run faktspense import ./export/
+uv run faktspense import ./export/ --dry-run
+uv run faktspense import ./export/ --auto-create-subjects
+uv run faktspense import ./export/ --no-create
+uv run faktspense import ./export/ --refresh-subjects
 
 # Status
-uv run faktspense status export.json
+uv run faktspense status ./export/
 
 # Tests + coverage
 uv run pytest
@@ -64,9 +64,11 @@ ANTHROPIC_MODEL=claude-haiku-4-5      # optional override
 ```
 src/fakturoid_naklady/
 ├── models.py              # Pydantic: VendorInfo, InvoiceLine, ExtractedInvoice,
-│                          #           FakturoidStatus, ExportRecord, ExportFile,
+│                          #           FakturoidStatus, ExportRecord,
 │                          #           FakturoidStatusValue Literal
-├── export.py              # load / save (atomic) / upsert / find_by_id / update_status
+├── export.py              # ExportStore: directory of <pdf_stem>_<sha8>.json sidecars,
+│                          #   atomic per-record writes, upsert / find_by_id /
+│                          #   update_status / records / path_for
 ├── fakturoid/
 │   ├── auth.py            # TokenProvider protocol + OAuth2TokenProvider + StaticTokenProvider
 │   ├── client.py          # FakturoidClient: UA, auth header, 401 refetch, 429 backoff, FakturoidError
@@ -89,9 +91,11 @@ src/fakturoid_naklady/
 
 **Pure vs. impure boundary:** models, `export` helpers, `build_expense_payload`, and hashing are pure — unit-tested without I/O. Network/filesystem sits at the edges.
 
-## export.json — review artifact + state tracker
+## Sidecar directory — review artifact + state tracker
 
-Single file per batch. Each invoice entry has extracted fields (editable) plus a `fakturoid` block:
+The output of `extract` is a directory; each PDF gets its own JSON file
+(`ExportStore` in `export.py`). One sidecar per invoice — extracted fields
+(editable) plus a `fakturoid` block:
 
 ```json
 {
@@ -107,9 +111,21 @@ Single file per batch. Each invoice entry has extracted fields (editable) plus a
 
 `status` values (`FakturoidStatusValue`): `pending` | `imported` | `error` | `skipped`
 
-The `id` field is `sha256(pdf_bytes)` — used as both dedup key and Fakturoid `custom_id`.
+**Filename rule:** `<safe_pdf_stem>_<sha8>.json`. `safe_pdf_stem` is the
+PDF filename without extension, with anything outside `[A-Za-z0-9._-]`
+replaced by `_`. `sha8` is the first 8 chars of the full sha256 of the
+PDF bytes. The full sha256 lives in the sidecar's `id` field — it is the
+Fakturoid `custom_id` and the source-of-truth for change detection.
 
-Writes are atomic (temp file + `os.replace`); `save()` is called after each record so a partial batch is always safe to resume.
+**Re-run / change detection.** On every `extract` pass the tool computes
+each input PDF's sha256. If a sidecar already has that exact `id` →
+skipped. If not → re-extracts and `ExportStore.upsert` deletes any stale
+sidecar that pointed at the same `source_pdf` with a different hash, so
+each PDF maps to at most one current sidecar.
+
+Writes are atomic (temp file + `os.replace`); each sidecar is rewritten
+immediately on every state change so a partial batch is always safe to
+resume.
 
 ## Hard rules
 

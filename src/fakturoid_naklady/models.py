@@ -121,10 +121,3 @@ class ExportRecord(BaseModel):
             total=extracted.total,
             total_vat=extracted.total_vat,
         )
-
-
-class ExportFile(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    created_at: datetime
-    invoices: list[ExportRecord] = Field(default_factory=list)
