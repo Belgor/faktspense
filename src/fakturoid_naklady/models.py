@@ -11,6 +11,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 FakturoidStatusValue = Literal["pending", "imported", "error", "skipped"]
 
 
+def normalize_ico(v: object) -> str | None:
+    if v is None or v == "":
+        return None
+    if isinstance(v, int):
+        v = str(v)
+    if not isinstance(v, str):
+        raise TypeError("ico must be a string or int")
+    digits = v.strip()
+    if not digits:
+        return None
+    if not digits.isdigit():
+        raise ValueError(f"ico must be digits only, got {v!r}")
+    return digits.zfill(8)
+
+
 class VendorInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -22,18 +37,7 @@ class VendorInfo(BaseModel):
     @field_validator("ico", mode="before")
     @classmethod
     def _normalize_ico(cls, v: object) -> str | None:
-        if v is None or v == "":
-            return None
-        if isinstance(v, int):
-            v = str(v)
-        if not isinstance(v, str):
-            raise TypeError("ico must be a string or int")
-        digits = v.strip()
-        if not digits:
-            return None
-        if not digits.isdigit():
-            raise ValueError(f"ico must be digits only, got {v!r}")
-        return digits.zfill(8)
+        return normalize_ico(v)
 
 
 class InvoiceLine(BaseModel):
