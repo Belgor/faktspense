@@ -14,17 +14,20 @@ Not a pytest test — invoked directly. Kept outside ``tests/`` so
 Persistence goes through the production :class:`ExportStore`, so this
 script exercises the same per-invoice sidecar layout the CLI uses.
 
-Credentials are provided as sbx sandbox secrets and injected into this
-sandbox as TEST_-prefixed env vars (the prefix keeps them lexically
-distinct from the unprefixed production vars the CLI reads):
+Credentials are read from TEST_-prefixed env vars (the prefix keeps
+them lexically distinct from the unprefixed production vars the CLI
+reads):
 
     TEST_FAKTUROID_CLIENT_ID
     TEST_FAKTUROID_CLIENT_SECRET
     TEST_FAKTUROID_SLUG           (must be a dedicated test account)
     TEST_ANTHROPIC_API_KEY
 
-Set on the host with ``sbx secret set <sandbox-name> <NAME> -t "..."``;
-restart the sandbox to pick up newly-added or rotated secrets.
+See ``docs/AUTOTEST.md`` for the recommended setup: keep them in
+``~/.config/faktspense/.env.autotest`` on the host, mount the dir
+read-only into the sandbox via ``sbx run claude . ~/.config/faktspense:ro``,
+then ``set -a; source ~/.config/faktspense/.env.autotest; set +a``
+before running this script.
 
 Artifacts written to ``--work-dir`` (default
 ``test_data_real/_faktspense_run/``):

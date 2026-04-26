@@ -20,28 +20,85 @@ Not wired into pytest — `uv run pytest` never touches real APIs.
 A **dedicated Fakturoid test account** (Fakturoid has no sandbox — use a
 separate real account you don't mind filling with test data).
 
-Credentials are provided as **`sbx` sandbox secrets**, not plain
-environment exports. The script reads `TEST_`-prefixed env vars; the
-prefix keeps test-account credentials lexically distinct from the
-unprefixed production credentials the CLI reads.
+The script reads four `TEST_`-prefixed env vars (the prefix keeps
+test-account credentials lexically distinct from the unprefixed
+production credentials the CLI reads):
 
-Set them once on the host:
+    TEST_FAKTUROID_CLIENT_ID
+    TEST_FAKTUROID_CLIENT_SECRET
+    TEST_FAKTUROID_SLUG            # must be a dedicated test account
+    TEST_ANTHROPIC_API_KEY
 
-```bash
-sbx secret set <sandbox-name> TEST_FAKTUROID_CLIENT_ID     -t "..."
-sbx secret set <sandbox-name> TEST_FAKTUROID_CLIENT_SECRET -t "..."
-sbx secret set <sandbox-name> TEST_FAKTUROID_SLUG          -t "..."
-sbx secret set <sandbox-name> TEST_ANTHROPIC_API_KEY       -t "sk-ant-..."
-
-sbx secret list   # verify
-```
-
-Secrets are injected at sandbox startup. After adding or rotating a
-secret, restart the sandbox.
+`sbx secret set` does **not** work for these — it only supports a fixed
+allowlist of named services (anthropic/aws/github/openai/…) and even
+those are exposed only to the network proxy, not as env vars inside the
+sandbox. The setup below uses a host file mounted read-only into the
+sandbox instead.
 
 Input PDFs live in `test_data_real/` (gitignored).
 
+### One-time host setup
+
+Create the env file in your host home dir, mode 600:
+
+```bash
+mkdir -p ~/.config/faktspense
+chmod 700 ~/.config/faktspense
+
+cat > ~/.config/faktspense/.env.autotest <<'EOF'
+export TEST_FAKTUROID_CLIENT_ID=...
+export TEST_FAKTUROID_CLIENT_SECRET=...
+export TEST_FAKTUROID_SLUG=...
+export TEST_ANTHROPIC_API_KEY=sk-ant-...
+EOF
+
+chmod 600 ~/.config/faktspense/.env.autotest
+```
+
+The file lives only on the host; it never enters the sandbox image,
+shell history, or git.
+
+### Launching the sandbox with the env file mounted
+
+`sbx run` accepts additional workspace mounts as trailing path args, with
+`:ro` for read-only. Mount the parent dir read-only when launching:
+
+```bash
+sbx run claude . ~/.config/faktspense:ro
+```
+
+If your sandbox already exists and you want the mount to apply, recreate
+it (`sbx rm <sandbox-name>` then the command above) — additional
+workspaces are bound at sandbox-create time, not on attach.
+
+After attach, verify the mount inside the sandbox:
+
+```bash
+ls -l ~/.config/faktspense/.env.autotest      # should show the file, ro
+mount | grep faktspense                       # should show ro mount
+```
+
+### Loading the env vars before each autotest run
+
+```bash
+set -a
+source ~/.config/faktspense/.env.autotest
+set +a
+```
+
+`set -a` exports every variable assigned until `set +a`, so this works
+whether or not your file uses the `export ` prefix. Verify:
+
+```bash
+env | grep '^TEST_FAKTUROID\|^TEST_ANTHROPIC' | sed 's/=.*/=<set>/'
+```
+
+The vars stay in the current shell only — they are not persisted to the
+sandbox image.
+
 ## Run
+
+Source the env file first (see "Loading the env vars" above), then:
 
 ```bash
 # Full run, artifacts left behind in the test account for inspection:
@@ -56,6 +113,17 @@ uv run python scripts/e2e_real.py --skip-extract
 # Validate an existing import without importing again:
 uv run python scripts/e2e_real.py --skip-extract --skip-import
 ```
+
+One-liner that sources + runs (handy for re-runs in the same shell):
+
+```bash
+( set -a; source ~/.config/faktspense/.env.autotest; set +a;
+  uv run python scripts/e2e_real.py --cleanup )
+```
+
+The script exits non-zero on any failed check; read
+`test_data_real/_faktspense_run/report.json` (or `report.md`) for
+details.
 
 ## Artifacts (in `test_data_real/_faktspense_run/`)
 
