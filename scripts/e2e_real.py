@@ -102,7 +102,6 @@ class Check:
 class RecordReport:
     record_id: str
     pdf_name: str
-    # Extraction data (from sidecar)
     invoice_number: str | None = None
     vendor_name: str | None = None
     vendor_ico: str | None = None
@@ -115,13 +114,10 @@ class RecordReport:
     arithmetic_warnings: list[str] = field(default_factory=list)
     sonnet_ok: bool | None = None
     sonnet_issues: list[str] = field(default_factory=list)
-    # Import state
     expense_id: int | None = None
     subject_id: int | None = None
     subject_was_created: bool = False
-    # Quality
     extraction_diffs: list[str] = field(default_factory=list)
-    # Checks + CLI output
     checks: list[Check] = field(default_factory=list)
     cli_extract_output: str = ""
     cli_import_output: str = ""
@@ -272,6 +268,15 @@ def _safe_normalize_ico(v: object) -> str | None:
         return None
 
 
+def _reload_store(work_dir: Path, report: RunReport) -> ExportStore:
+    """Reload sidecars from disk into an ExportStore, populating the report."""
+    store = ExportStore(work_dir)
+    for rec in store.records():
+        rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
+        _populate_extraction_data(rr, rec)
+    return store
+
+
 # ----------------------------------------------------------------------------
 # Phases
 # ----------------------------------------------------------------------------
@@ -299,11 +304,12 @@ def phase_extract(
     cli_output = (result.stdout + result.stderr).strip()
 
     store = ExportStore(work_dir)
+    by_source = {Path(r.source_pdf): r for r in store.records()}
 
     for pdf in pdfs:
-        invoice_id = sha256_file(pdf)
-        record = store.find_by_id(invoice_id)
+        record = by_source.get(pdf.resolve())
         if record is None:
+            invoice_id = sha256_file(pdf)
             rr = report.records.setdefault(
                 invoice_id,
                 RecordReport(record_id=invoice_id, pdf_name=pdf.name),
@@ -353,7 +359,6 @@ def phase_import(
     result = _run_cli(cmd, cli_env)
     cli_output = (result.stdout + result.stderr).strip()
 
-    # Refresh to discover subjects created by the CLI
     subjects.refresh()
     new_subject_ids = subjects.loaded_subject_ids() - pre_subject_ids
     for sid in sorted(new_subject_ids):
@@ -854,25 +859,24 @@ def main() -> int:
             if not args.skip_extract:
                 store = phase_extract(args.pdf_dir, work_dir, report, cli_env, args.verify)
             else:
-                store = ExportStore(work_dir)
+                store = _reload_store(work_dir, report)
                 for rec in store.records():
-                    rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
-                    _populate_extraction_data(rr, rec)
-                    rr.add(CHECK_EXTRACT, True, "skipped (--skip-extract); reusing sidecar")
+                    report.records[rec.id].add(
+                        CHECK_EXTRACT, True, "skipped (--skip-extract); reusing sidecar"
+                    )
 
             if not args.skip_import:
                 store = phase_import(store, report, subjects, cli_env)
             else:
-                store = ExportStore(work_dir)
+                store = _reload_store(work_dir, report)
                 for rec in store.records():
-                    rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
-                    _populate_extraction_data(rr, rec)
                     if rec.fakturoid.status == "imported":
+                        rr = report.records[rec.id]
                         rr.add(
                             CHECK_EXPENSE_CREATE,
                             True,
-                            f"skipped (--skip-import); "
-                            f"already imported (expense_id={rr.expense_id})",
+                            f"skipped (--skip-import); already imported"
+                            f" (expense_id={rr.expense_id})",
                         )
 
             if not args.skip_validate:
