@@ -92,10 +92,14 @@ class ClaudeExtractor:
             system=system,
             messages=[{"role": "user", "content": content}],
         )
-        # SDK returns a Message with .content = [TextBlock, ...]
-        blocks = getattr(resp, "content", [])
-        texts = [getattr(b, "text", "") for b in blocks if getattr(b, "type", None) == "text"]
-        return "".join(texts).strip()
+        return _extract_text(resp)
+
+
+def _extract_text(resp: Any) -> str:
+    # SDK returns a Message with .content = [TextBlock, ...]
+    blocks = getattr(resp, "content", [])
+    texts = [getattr(b, "text", "") for b in blocks if getattr(b, "type", None) == "text"]
+    return "".join(texts).strip()
 
 
 def _build_content(rendered: RenderedPdf) -> list[dict[str, Any]]:
@@ -164,8 +168,8 @@ class SonnetVerifier:
         self._model = model or os.environ.get("ANTHROPIC_VERIFY_MODEL", DEFAULT_VERIFY_MODEL)
 
     def verify(self, rendered: RenderedPdf, extracted: ExtractedInvoice) -> SonnetVerdict:
-        content = list(_build_content(rendered))
-        extracted_json = extracted.model_dump_json(indent=2)
+        content = _build_content(rendered)
+        extracted_json = extracted.model_dump_json()
         content.append(
             {
                 "type": "text",
@@ -181,13 +185,11 @@ class SonnetVerifier:
             system=VERIFY_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": content}],
         )
-        blocks = getattr(resp, "content", [])
-        texts = [getattr(b, "text", "") for b in blocks if getattr(b, "type", None) == "text"]
-        raw = "".join(texts).strip()
+        raw = _extract_text(resp)
         try:
             data = json.loads(_strip_fences(raw))
             return SonnetVerdict.model_validate(data)
         except Exception:
             return SonnetVerdict(
-                ok=True, issues=[f"Verification response unparseable: {raw[:200]}"]
+                ok=False, issues=[f"Verification response unparseable: {raw[:200]}"]
             )

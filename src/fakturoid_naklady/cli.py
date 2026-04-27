@@ -71,20 +71,19 @@ def _build_fakturoid() -> tuple[FakturoidClient, httpx.Client]:
     return FakturoidClient(slug=slug, http=http, token_provider=tp), http
 
 
-def _build_extractor() -> ClaudeExtractor:
+def _build_anthropic_client() -> Any:
     import anthropic  # lazy import
 
     _require_env("ANTHROPIC_API_KEY")
-    anth = anthropic.Anthropic()
-    return ClaudeExtractor(client=anth)
+    return anthropic.Anthropic()
+
+
+def _build_extractor() -> ClaudeExtractor:
+    return ClaudeExtractor(client=_build_anthropic_client())
 
 
 def _build_verifier() -> SonnetVerifier:
-    import anthropic  # lazy import
-
-    _require_env("ANTHROPIC_API_KEY")
-    anth = anthropic.Anthropic()
-    return SonnetVerifier(client=anth)
+    return SonnetVerifier(client=_build_anthropic_client())
 
 
 def _vendor_prompt(
@@ -148,11 +147,9 @@ def extract(
         rendered = render_pdf(pdf)
         extracted = extractor.extract(rendered)
 
-        # Pass 1: arithmetic cross-check
         arith_warning = arithmetic_validate(extracted)
         warnings = [arith_warning] if arith_warning else []
 
-        # Pass 2: Sonnet semantic verification
         sonnet_verdict = None
         if verifier is not None:
             console.print("  [dim]verifying with Sonnet...[/dim]")
@@ -250,9 +247,6 @@ def import_cmd(
             except Exception as e:
                 store.update_status(record.id, status="error", error=str(e))
                 raise
-
-            if outcome.status == "needs_review":
-                continue
 
             store.update_status(
                 record.id,
