@@ -382,9 +382,9 @@ def phase_validate_expenses(
             problems.append(
                 f"custom_id mismatch (expected {record.id!r}, got {body.get('custom_id')!r})"
             )
-        if body.get("number") != record.invoice_number:
+        if body.get("original_number") != record.invoice_number:
             problems.append(
-                f"number mismatch (expected {record.invoice_number!r}, got {body.get('number')!r})"
+                f"original_number mismatch (expected {record.invoice_number!r}, got {body.get('original_number')!r})"
             )
         if body.get("subject_id") != rr.subject_id:
             problems.append(

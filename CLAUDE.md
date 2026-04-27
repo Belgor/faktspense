@@ -132,6 +132,7 @@ resume.
 - **Never** load `.env` files — credentials come from env vars only.
 - **Always** send `User-Agent: faktspense/0.1` on every Fakturoid request. Omitting it returns 400. Do not embed email or other PII in the header (see memory: no-PII-in-User-Agent feedback).
 - **Never** POST to Fakturoid if `fakturoid.status == "imported"` — `ImportRunner.run_one` raises `AlreadyImportedError` with existing `expense_id` and `imported_at`.
+- **Always** use `original_number` (not `number`) for the vendor's invoice number. The `number` field is Fakturoid's own sequence number and must match the account's configured format — omit it so Fakturoid auto-assigns.
 - **Always** attach the original PDF as base64 `data:application/pdf;base64,...` in the `attachments` array on every expense.
 - **Never** import without setting `custom_id = record.id` — this is the idempotency key.
 - **Always** preserve IČO as 8-char string (validator in `VendorInfo` zero-pads; never coerce to int).
@@ -164,7 +165,7 @@ resume.
 
 | Operation | Endpoint |
 |---|---|
-| Token | `POST https://app.fakturoid.cz/oauth/token` (Client Credentials) |
+| Token | `POST https://app.fakturoid.cz/api/v3/oauth/token` (Client Credentials) |
 | List subjects | `GET /accounts/{slug}/subjects.json?page=N` (paginated, stop-on-empty) |
 | Create subject | `POST /accounts/{slug}/subjects.json` |
 | Create expense | `POST /accounts/{slug}/expenses.json` |

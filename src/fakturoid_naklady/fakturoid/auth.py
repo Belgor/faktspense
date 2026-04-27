@@ -6,7 +6,7 @@ from typing import Protocol
 
 import httpx
 
-OAUTH_TOKEN_URL = "https://app.fakturoid.cz/oauth/token"
+OAUTH_TOKEN_URL = "https://app.fakturoid.cz/api/v3/oauth/token"
 
 
 class TokenProvider(Protocol):

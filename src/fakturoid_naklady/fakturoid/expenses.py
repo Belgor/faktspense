@@ -34,18 +34,18 @@ def build_expense_payload(
     payload: dict[str, Any] = {
         "custom_id": record.id,
         "subject_id": subject_id,
-        "number": record.invoice_number,
+        "original_number": record.invoice_number,
         "issued_on": record.issued_on.isoformat(),
         "currency": record.currency,
         "lines": lines,
         "attachments": [
             {
                 "filename": pdf_filename,
-                "download_url": f"data:application/pdf;base64,{b64}",
+                "data_url": f"data:application/pdf;base64,{b64}",
             }
         ],
     }
-    if record.due_date is not None:
+    if record.due_date is not None and record.due_date >= record.issued_on:
         payload["due_on"] = record.due_date.isoformat()
     if record.taxable_fulfillment_due is not None:
         payload["taxable_fulfillment_due"] = record.taxable_fulfillment_due.isoformat()

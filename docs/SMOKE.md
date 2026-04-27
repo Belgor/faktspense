@@ -91,6 +91,7 @@ A real PDF invoice at `./invoice.pdf` (any Czech supplier invoice).
    - Expense present under the expected supplier.
    - Original PDF attached.
    - `custom_id` matches the sidecar's `id` (full sha256 hex).
+   - `original_number` matches the vendor's invoice number from the sidecar (not `number`, which is Fakturoid's own sequence).
    - Subject IČO matches `vendor.ico` from the sidecar (8-digit, zero-padded).
 
 ## Subject cache

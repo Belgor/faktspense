@@ -123,7 +123,7 @@ class SubjectStore:
         if vendor.dic:
             payload["vat_no"] = vendor.dic
         if vendor.address:
-            payload["street"] = vendor.address
+            payload["street"] = vendor.address[:100]
         resp = self._client.request(
             "POST",
             self._client.account_url("/subjects.json"),
