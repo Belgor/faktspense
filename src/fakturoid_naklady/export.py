@@ -17,6 +17,7 @@ from pathlib import Path
 from .models import ExportRecord, FakturoidStatus, FakturoidStatusValue
 
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+_SIDECAR_RE = re.compile(r".+_[0-9a-f]{8}\.json$")
 
 
 def _safe_stem(stem: str) -> str:
@@ -110,7 +111,7 @@ class ExportStore:
         index: dict[str, ExportRecord] = {}
         if self.root.is_dir():
             for path in sorted(self.root.glob("*.json")):
-                if path.name.startswith("."):
+                if not _SIDECAR_RE.match(path.name):
                     continue
                 try:
                     rec = ExportRecord.model_validate_json(path.read_text(encoding="utf-8"))
