@@ -1,49 +1,43 @@
 """Live e2e autotest against a real Fakturoid *test* account.
 
-Designed as an iteration tool for agentic development. The script really
-extracts invoice data from PDFs, really creates subjects + expenses in
-Fakturoid, and then GETs each one back to verify the data is there and
-correct. Every check produces a structured event in ``report.json``;
-every Fakturoid HTTP request is appended to ``api.log``. An agent reading
-those artifacts can diagnose what went wrong without re-running the
-script.
+Drives the production faktspense CLI (faktspense extract + faktspense import)
+against a dedicated test account, then verifies the results with direct
+Fakturoid API calls. Every check is recorded in report.json; every Fakturoid
+HTTP request is appended to api.log.
 
-Not a pytest test — invoked directly. Kept outside ``tests/`` so
-``uv run pytest`` never hits the real APIs.
+Intended workflow for an agent iterating on faktspense:
 
-Persistence goes through the production :class:`ExportStore`, so this
-script exercises the same per-invoice sidecar layout the CLI uses.
+1. Make a code change.
+2. Run `uv run python scripts/e2e_real.py --cleanup`.
+3. Read test_data_real/_faktspense_run/report.json (or report.md).
+4. Fix any failed checks; loop. Use --skip-extract to reuse sidecars when
+   only fixing import or validation issues.
 
-Credentials are read from TEST_-prefixed env vars (the prefix keeps
-them lexically distinct from the unprefixed production vars the CLI
-reads):
+Not wired into pytest — `uv run pytest` never touches real APIs.
 
-    TEST_FAKTUROID_CLIENT_ID
-    TEST_FAKTUROID_CLIENT_SECRET
-    TEST_FAKTUROID_SLUG           (must be a dedicated test account)
-    TEST_ANTHROPIC_API_KEY
+Credentials are read from TEST_-prefixed env vars. Load them from the
+mounted secrets file before running:
 
-See ``docs/AUTOTEST.md`` for the recommended setup: keep them in
-``~/.config/faktspense/.env.autotest`` on the host, mount the dir
-read-only into the sandbox via ``sbx run claude . ~/.config/faktspense:ro``,
-then ``set -a; source ~/.config/faktspense/.env.autotest; set +a``
-before running this script.
+    ls -l /home/belgor/.config/faktspense/.env.autotest
+    mount | grep faktspense           # confirm ro virtiofs mount
+    set -a; source /home/belgor/.config/faktspense/.env.autotest; set +a
+    env | grep '^TEST_' | sed 's/=.*/=<set>/'
 
-Artifacts written to ``--work-dir`` (default
-``test_data_real/_faktspense_run/``):
+See docs/AUTOTEST.md for the full setup instructions.
 
-    <pdf_stem>_<sha8>.json   one sidecar per PDF (production layout)
+Artifacts written to --work-dir (default test_data_real/_faktspense_run/):
+
+    <pdf_stem>_<sha8>.json   one sidecar per PDF (same layout the CLI writes)
     .subjects_cache.json     isolated subject cache
-    report.json              structured run log — one record entry per
-                             invoice with pass/fail per check, full
-                             Fakturoid response bodies, extraction diffs
-    report.md                human-readable summary of the same data
+    report.json              structured run log
+    report.md                human-readable summary (extraction data + results)
     api.log                  one line per Fakturoid HTTP request
 
 Usage:
     uv run python scripts/e2e_real.py
     uv run python scripts/e2e_real.py --cleanup
-    uv run python scripts/e2e_real.py --skip-extract     # reuse sidecars
+    uv run python scripts/e2e_real.py --verify          # Sonnet second-pass check
+    uv run python scripts/e2e_real.py --skip-extract    # reuse existing sidecars
 """
 
 from __future__ import annotations
@@ -51,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -61,13 +56,10 @@ from typing import Any
 
 import httpx
 
-# Make `src/` importable when running this file directly.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from fakturoid_naklady.export import ExportStore, sha256_file  # noqa: E402
-from fakturoid_naklady.extraction.claude import ClaudeExtractor  # noqa: E402
-from fakturoid_naklady.extraction.renderer import render_pdf  # noqa: E402
 from fakturoid_naklady.fakturoid.auth import OAuth2TokenProvider  # noqa: E402
 from fakturoid_naklady.fakturoid.client import (  # noqa: E402
     USER_AGENT,
@@ -75,13 +67,7 @@ from fakturoid_naklady.fakturoid.client import (  # noqa: E402
     FakturoidError,
 )
 from fakturoid_naklady.fakturoid.subjects import SubjectStore  # noqa: E402
-from fakturoid_naklady.models import ExportRecord, VendorInfo, normalize_ico  # noqa: E402
-from fakturoid_naklady.pipeline import (  # noqa: E402
-    AlreadyImportedError,
-    ImportFlags,
-    ImportRunner,
-    VendorPromptAction,
-)
+from fakturoid_naklady.models import ExportRecord, normalize_ico  # noqa: E402
 
 ENV_PREFIX = "TEST_"
 REQUIRED_ENV = (
@@ -116,14 +102,29 @@ class Check:
 class RecordReport:
     record_id: str
     pdf_name: str
+    # Extraction data (from sidecar)
     invoice_number: str | None = None
     vendor_name: str | None = None
     vendor_ico: str | None = None
+    vendor_dic: str | None = None
+    issued_on: str | None = None
+    due_date: str | None = None
+    currency: str | None = None
+    line_count: int = 0
+    extracted_total: Decimal | None = None
+    arithmetic_warnings: list[str] = field(default_factory=list)
+    sonnet_ok: bool | None = None
+    sonnet_issues: list[str] = field(default_factory=list)
+    # Import state
     expense_id: int | None = None
     subject_id: int | None = None
     subject_was_created: bool = False
+    # Quality
     extraction_diffs: list[str] = field(default_factory=list)
+    # Checks + CLI output
     checks: list[Check] = field(default_factory=list)
+    cli_extract_output: str = ""
+    cli_import_output: str = ""
 
     @property
     def hard_ok(self) -> bool:
@@ -164,7 +165,25 @@ def _require_env() -> None:
     missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
     if missing:
         print(f"ERROR: missing env vars: {', '.join(missing)}", file=sys.stderr)
+        print(
+            "  Load with: set -a; source /home/belgor/.config/faktspense/.env.autotest; set +a",
+            file=sys.stderr,
+        )
         sys.exit(2)
+    print("[env] credentials loaded:")
+    for k in REQUIRED_ENV:
+        suffix = f" ({os.environ[k]})" if k.endswith("_SLUG") else ""
+        print(f"  {k}=<set>{suffix}")
+
+
+def _build_cli_env() -> dict[str, str]:
+    """Remap TEST_* vars to the unprefixed names the CLI expects."""
+    env = os.environ.copy()
+    env["FAKTUROID_CLIENT_ID"] = env[f"{ENV_PREFIX}FAKTUROID_CLIENT_ID"]
+    env["FAKTUROID_CLIENT_SECRET"] = env[f"{ENV_PREFIX}FAKTUROID_CLIENT_SECRET"]
+    env["FAKTUROID_SLUG"] = env[f"{ENV_PREFIX}FAKTUROID_SLUG"]
+    env["ANTHROPIC_API_KEY"] = env[f"{ENV_PREFIX}ANTHROPIC_API_KEY"]
+    return env
 
 
 def _build_http(log_fh: Any) -> httpx.Client:
@@ -199,36 +218,42 @@ def _build_fakturoid(http: httpx.Client) -> FakturoidClient:
     )
 
 
-def _build_extractor() -> ClaudeExtractor:
-    import anthropic
-
-    return ClaudeExtractor(
-        client=anthropic.Anthropic(api_key=os.environ[f"{ENV_PREFIX}ANTHROPIC_API_KEY"])
-    )
-
-
-def _auto_create_prompt(
-    vendor: VendorInfo, candidates: list[dict[str, Any]]
-) -> tuple[VendorPromptAction, dict[str, Any] | None]:
-    return ("create", None)
-
-
 def _record_report_for(report: RunReport, record: ExportRecord, pdf_name: str) -> RecordReport:
     rr = report.records.get(record.id)
     if rr is None:
-        rr = RecordReport(
-            record_id=record.id,
-            pdf_name=pdf_name,
-            invoice_number=record.invoice_number,
-            vendor_name=record.vendor.name,
-            vendor_ico=record.vendor.ico,
-        )
+        rr = RecordReport(record_id=record.id, pdf_name=pdf_name)
         report.records[record.id] = rr
-    else:
-        rr.invoice_number = record.invoice_number
-        rr.vendor_name = record.vendor.name
-        rr.vendor_ico = record.vendor.ico
     return rr
+
+
+def _populate_extraction_data(rr: RecordReport, record: ExportRecord) -> None:
+    """Copy all extracted fields from a sidecar into RecordReport."""
+    rr.invoice_number = record.invoice_number
+    rr.vendor_name = record.vendor.name
+    rr.vendor_ico = record.vendor.ico
+    rr.vendor_dic = record.vendor.dic
+    rr.issued_on = record.issued_on.isoformat() if record.issued_on else None
+    rr.due_date = record.due_date.isoformat() if record.due_date else None
+    rr.currency = record.currency
+    rr.line_count = len(record.lines)
+    rr.extracted_total = record.total
+    rr.arithmetic_warnings = [w.message for w in record.fakturoid.warnings]
+    if record.fakturoid.sonnet_verdict is not None:
+        rr.sonnet_ok = record.fakturoid.sonnet_verdict.ok
+        rr.sonnet_issues = list(record.fakturoid.sonnet_verdict.issues)
+    if record.fakturoid.status == "imported":
+        rr.expense_id = record.fakturoid.expense_id
+        rr.subject_id = record.fakturoid.subject_id
+
+
+def _run_cli(cmd: list[str], cli_env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    print(f"  $ {' '.join(cmd)}")
+    result = subprocess.run(cmd, env=cli_env, capture_output=True, text=True)
+    for line in result.stdout.strip().splitlines():
+        print(f"  {line}")
+    for line in result.stderr.strip().splitlines():
+        print(f"  STDERR: {line}", file=sys.stderr)
+    return result
 
 
 def _parse_decimal(v: Any) -> Decimal | None:
@@ -241,7 +266,6 @@ def _parse_decimal(v: Any) -> Decimal | None:
 
 
 def _safe_normalize_ico(v: object) -> str | None:
-    """Like models.normalize_ico but returns None on non-digit input rather than raising."""
     try:
         return normalize_ico(v)
     except (ValueError, TypeError):
@@ -253,111 +277,117 @@ def _safe_normalize_ico(v: object) -> str | None:
 # ----------------------------------------------------------------------------
 
 
-def phase_extract(pdf_dir: Path, store: ExportStore, report: RunReport) -> None:
+def phase_extract(
+    pdf_dir: Path,
+    work_dir: Path,
+    report: RunReport,
+    cli_env: dict[str, str],
+    verify: bool,
+) -> ExportStore:
+    """Run `faktspense extract` via CLI; reload sidecars; populate report."""
+    cmd = ["uv", "run", "faktspense", "extract", str(pdf_dir), "-o", str(work_dir)]
+    if verify:
+        cmd.append("--verify")
     print(f"\n[extract] scanning {pdf_dir}")
+
     pdfs = sorted(p for p in pdf_dir.glob("*.pdf") if p.is_file())
     if not pdfs:
         print(f"ERROR: no PDFs in {pdf_dir}", file=sys.stderr)
         sys.exit(1)
 
-    extractor = _build_extractor()
+    result = _run_cli(cmd, cli_env)
+    cli_output = (result.stdout + result.stderr).strip()
+
+    store = ExportStore(work_dir)
 
     for pdf in pdfs:
         invoice_id = sha256_file(pdf)
-        existing = store.find_by_id(invoice_id)
-        if existing is not None:
-            rr = _record_report_for(report, existing, pdf.name)
-            rr.add(CHECK_EXTRACT, True, "reused existing sidecar (sha256 matches)")
-            print(f"  skip {pdf.name} — already extracted")
-            continue
-
-        print(f"  extract {pdf.name}")
-        try:
-            rendered = render_pdf(pdf)
-            extracted = extractor.extract(rendered)
-        except Exception as e:
+        record = store.find_by_id(invoice_id)
+        if record is None:
             rr = report.records.setdefault(
                 invoice_id,
                 RecordReport(record_id=invoice_id, pdf_name=pdf.name),
             )
-            rr.add(CHECK_EXTRACT, False, f"extract failed: {e}")
+            rr.cli_extract_output = cli_output
+            rr.add(
+                CHECK_EXTRACT,
+                False,
+                f"no sidecar written (CLI exit={result.returncode})",
+            )
             continue
 
-        record = ExportRecord.from_extraction(
-            invoice_id=invoice_id,
-            source_pdf=str(pdf.resolve()),
-            extracted_at=datetime.now(UTC),
-            extracted=extracted,
-        )
-        store.upsert(record)
         rr = _record_report_for(report, record, pdf.name)
+        _populate_extraction_data(rr, record)
+        rr.cli_extract_output = cli_output
+        note = "reused sidecar" if "already extracted" in result.stdout else "extracted"
         rr.add(
             CHECK_EXTRACT,
             True,
-            f"extracted invoice_number={record.invoice_number} vendor={record.vendor.name}",
+            f"{note}: {record.invoice_number} — {record.vendor.name!r}",
         )
 
-    print(f"[extract] sidecars in {store.root}")
+    print(f"[extract] sidecars in {work_dir}")
+    return store
 
 
 def phase_import(
     store: ExportStore,
     report: RunReport,
-    client: FakturoidClient,
     subjects: SubjectStore,
-) -> None:
+    cli_env: dict[str, str],
+) -> ExportStore:
+    """Run `faktspense import` via CLI; snapshot subjects for cleanup tracking."""
     print(f"\n[import] {store.root}")
 
-    pre_existing_subject_ids = subjects.loaded_subject_ids()
-    runner = ImportRunner(
-        client=client,
-        subjects=subjects,
-        pdf_root=store.root,
-        vendor_prompt=_auto_create_prompt,
-    )
-    flags = ImportFlags(auto_create_subjects=True)
+    pre_subject_ids = subjects.loaded_subject_ids()
+
+    cmd = [
+        "uv",
+        "run",
+        "faktspense",
+        "import",
+        str(store.root),
+        "--auto-create-subjects",
+        "--force-review",
+    ]
+    result = _run_cli(cmd, cli_env)
+    cli_output = (result.stdout + result.stderr).strip()
+
+    # Refresh to discover subjects created by the CLI
+    subjects.refresh()
+    new_subject_ids = subjects.loaded_subject_ids() - pre_subject_ids
+    for sid in sorted(new_subject_ids):
+        if sid not in report.created_subject_ids:
+            report.created_subject_ids.append(sid)
+
+    store = ExportStore(store.root)
 
     for record in store.records():
         rr = _record_report_for(report, record, Path(record.source_pdf).name)
-        if record.fakturoid.status == "imported":
-            rr.expense_id = record.fakturoid.expense_id
-            rr.subject_id = record.fakturoid.subject_id
+        _populate_extraction_data(rr, record)
+        rr.cli_import_output = cli_output
+
+        status = record.fakturoid.status
+        if status == "imported":
+            rr.subject_was_created = (
+                record.fakturoid.subject_id is not None
+                and record.fakturoid.subject_id in new_subject_ids
+            )
             rr.add(
                 CHECK_EXPENSE_CREATE,
                 True,
-                f"already imported (expense_id={rr.expense_id})",
+                f"imported expense_id={rr.expense_id} subject_id={rr.subject_id}",
             )
-            print(f"  skip {record.invoice_number} — already imported")
-            continue
+        elif status == "error":
+            rr.add(CHECK_EXPENSE_CREATE, False, f"import failed: {record.fakturoid.error}")
+        else:
+            rr.add(
+                CHECK_EXPENSE_CREATE,
+                False,
+                f"status={status} (CLI exit={result.returncode})",
+            )
 
-        print(f"  import {record.invoice_number}")
-        try:
-            outcome = runner.run_one(record, flags)
-        except Exception as e:
-            rr.add(CHECK_EXPENSE_CREATE, False, f"import failed: {e}")
-            store.update_status(record.id, status="error", error=str(e))
-            continue
-
-        store.update_status(
-            record.id,
-            status=outcome.status,
-            subject_id=outcome.subject_id,
-            expense_id=outcome.expense_id,
-            imported_at=outcome.imported_at,
-        )
-        rr.subject_id = outcome.subject_id
-        rr.expense_id = outcome.expense_id
-        if outcome.subject_id and outcome.subject_id not in pre_existing_subject_ids:
-            rr.subject_was_created = True
-            if outcome.subject_id not in report.created_subject_ids:
-                report.created_subject_ids.append(outcome.subject_id)
-        ok = outcome.status == "imported"
-        rr.add(
-            CHECK_EXPENSE_CREATE,
-            ok,
-            f"status={outcome.status} "
-            f"expense_id={outcome.expense_id} subject_id={outcome.subject_id}",
-        )
+    return store
 
 
 def phase_validate_expenses(
@@ -444,15 +474,13 @@ def phase_validate_subjects(
         problems: list[str] = []
         if rec_ico and api_ico != rec_ico:
             problems.append(
-                "IČO mismatch "
-                f"(extracted={record.vendor.ico}, "
+                f"IČO mismatch (extracted={record.vendor.ico}, "
                 f"Fakturoid={body.get('registration_no')})"
             )
         elif not rec_ico and not api_name:
             problems.append("no IČO and no name on subject")
         if rec_name and api_name and rec_name.lower() not in api_name.lower():
-            # Soft: vendor names commonly differ in legal-form punctuation
-            # (e.g. "s.r.o." vs "s. r. o."). Don't fail the check on this.
+            # Soft: vendor names commonly differ in legal-form punctuation.
             rr.extraction_diffs.append(
                 f"vendor name: extracted={rec_name!r}, Fakturoid={api_name!r}"
             )
@@ -475,31 +503,49 @@ def phase_validate_subjects(
 def phase_idempotency(
     store: ExportStore,
     report: RunReport,
-    client: FakturoidClient,
-    subjects: SubjectStore,
+    cli_env: dict[str, str],
 ) -> None:
-    print("\n[idempotency] re-running import — every record should be refused")
-    runner = ImportRunner(
-        client=client,
-        subjects=subjects,
-        pdf_root=store.root,
-        vendor_prompt=_auto_create_prompt,
-    )
-    flags = ImportFlags(auto_create_subjects=True)
-    for record in store.records():
-        rr = report.records.get(record.id)
-        if rr is None or rr.expense_id is None:
+    """Re-run import; verify no expense_ids changed (no double-POST)."""
+    print("\n[idempotency] re-running import — every record should be skipped")
+
+    before = {
+        rec.id: rec.fakturoid.expense_id
+        for rec in store.records()
+        if rec.fakturoid.status == "imported"
+    }
+    if not before:
+        print("  no imported records to check")
+        return
+
+    cmd = [
+        "uv",
+        "run",
+        "faktspense",
+        "import",
+        str(store.root),
+        "--auto-create-subjects",
+    ]
+    _run_cli(cmd, cli_env)
+
+    fresh = ExportStore(store.root)
+    for rec in fresh.records():
+        rr = report.records.get(rec.id)
+        if rr is None or rec.id not in before:
             continue
-        try:
-            runner.run_one(record, flags)
-        except AlreadyImportedError:
-            rr.add(CHECK_IDEMPOTENCY, True, "re-import correctly raised AlreadyImportedError")
-            continue
-        rr.add(
-            CHECK_IDEMPOTENCY,
-            False,
-            "re-import did NOT raise AlreadyImportedError — duplicate POST risk",
-        )
+        old_eid = before[rec.id]
+        new_eid = rec.fakturoid.expense_id
+        if new_eid == old_eid:
+            rr.add(
+                CHECK_IDEMPOTENCY,
+                True,
+                f"re-import skipped — expense_id unchanged ({old_eid})",
+            )
+        else:
+            rr.add(
+                CHECK_IDEMPOTENCY,
+                False,
+                f"expense_id changed {old_eid} → {new_eid} — possible double-import",
+            )
 
 
 def phase_cleanup(
@@ -552,11 +598,20 @@ def write_json_report(path: Path, report: RunReport) -> None:
     )
 
 
+def _badge(rr: RecordReport, check_name: str) -> str:
+    for c in rr.checks:
+        if c.name == check_name:
+            return "✓" if c.ok else "✗"
+    return "—"
+
+
 def write_markdown_report(path: Path, report: RunReport) -> None:
     started = report.started_at.isoformat()
     finished = report.finished_at.isoformat() if report.finished_at else "—"
     total = len(report.records)
     failures = report.hard_failures
+    sorted_recs = sorted(report.records.values(), key=lambda r: r.pdf_name)
+
     lines: list[str] = [
         "# faktspense e2e run",
         "",
@@ -567,20 +622,97 @@ def write_markdown_report(path: Path, report: RunReport) -> None:
         f"- Work dir: {report.work_dir}",
         f"- Records:  {total}",
         f"- Hard failures: {len(failures)}",
+    ]
+
+    # --- Section A: Extraction data ---
+    lines += [
+        "",
+        "## Extracted invoice data",
+        "",
+        "| PDF | Vendor | IČO | Invoice # | Issued | Curr | Lines | Total | Warn |",
+        "|-----|--------|-----|-----------|--------|------|-------|-------|------|",
+    ]
+    for rr in sorted_recs:
+        if rr.arithmetic_warnings:
+            warn = "⚠ arith"
+        elif rr.sonnet_ok is False:
+            warn = "✗ Sonnet"
+        else:
+            warn = "—"
+        lines.append(
+            f"| {rr.pdf_name} | {rr.vendor_name or '—'} | {rr.vendor_ico or '—'}"
+            f" | {rr.invoice_number or '—'} | {rr.issued_on or '—'}"
+            f" | {rr.currency or '—'} | {rr.line_count}"
+            f" | {rr.extracted_total if rr.extracted_total is not None else '—'}"
+            f" | {warn} |"
+        )
+
+    sonnet_rows = [rr for rr in sorted_recs if rr.sonnet_ok is not None]
+    if sonnet_rows:
+        lines += ["", "### Sonnet verification", ""]
+        for rr in sonnet_rows:
+            badge = "✓ ok" if rr.sonnet_ok else "✗ issues"
+            issues = "; ".join(rr.sonnet_issues) if rr.sonnet_issues else "—"
+            lines.append(f"- **{rr.invoice_number or rr.pdf_name}** — {badge}: {issues}")
+
+    # --- Section B: Import results ---
+    lines += [
+        "",
+        "## Import results",
+        "",
+        "| Invoice # | expense_id | subject_id | subject | Fakturoid total | Lines | Attachment |",
+        "|-----------|-----------|-----------|---------|-----------------|-------|------------|",
+    ]
+    for rr in sorted_recs:
+        exp_check = next((c for c in rr.checks if c.name == CHECK_VALIDATE_EXPENSE), None)
+        fakt_total = fakt_lines = attachment = "—"
+        if exp_check and exp_check.data:
+            body = exp_check.data.get("fakturoid_response") or {}
+            raw = _parse_decimal(body.get("total"))
+            fakt_total = str(raw) if raw is not None else "—"
+            fakt_lines = str(len(body.get("lines") or []))
+            attachment = "✓" if body.get("attachments") else "✗"
+        subject_note = "created" if rr.subject_was_created else "reused"
+        lines.append(
+            f"| {rr.invoice_number or '—'} | {rr.expense_id or '—'}"
+            f" | {rr.subject_id or '—'} | {subject_note}"
+            f" | {fakt_total} | {fakt_lines} | {attachment} |"
+        )
+
+    # --- Section C: Summary table ---
+    lines += [
         "",
         "## Summary table",
         "",
-        "| OK | Invoice | PDF | expense_id | subject_id | Failed checks |",
-        "|----|---------|-----|------------|------------|---------------|",
+        "| OK | Invoice # | PDF | extract | import"
+        " | validate_expense | validate_subject | idempotency | Failed checks |",
+        "|----|-----------|-----|---------|--------"
+        "|------------------|------------------|-------------|---------------|",
     ]
-    for rr in sorted(report.records.values(), key=lambda r: r.pdf_name):
-        badge = "✓" if rr.hard_ok else "✗"
+    for rr in sorted_recs:
+        ok_badge = "✓" if rr.hard_ok else "✗"
         failed = ", ".join(c.name for c in rr.checks if not c.ok) or "—"
         lines.append(
-            f"| {badge} | {rr.invoice_number or '—'} | {rr.pdf_name} | "
-            f"{rr.expense_id or '—'} | {rr.subject_id or '—'} | {failed} |"
+            f"| {ok_badge} | {rr.invoice_number or '—'} | {rr.pdf_name}"
+            f" | {_badge(rr, CHECK_EXTRACT)}"
+            f" | {_badge(rr, CHECK_EXPENSE_CREATE)}"
+            f" | {_badge(rr, CHECK_VALIDATE_EXPENSE)}"
+            f" | {_badge(rr, CHECK_VALIDATE_SUBJECT)}"
+            f" | {_badge(rr, CHECK_IDEMPOTENCY)}"
+            f" | {failed} |"
         )
 
+    # --- Section D: Extraction-quality diffs ---
+    soft = [(rr, rr.extraction_diffs) for rr in report.records.values() if rr.extraction_diffs]
+    if soft:
+        lines += ["", "## Extraction-quality diffs (non-fatal)", ""]
+        for rr, diffs in sorted(soft, key=lambda x: x[0].pdf_name):
+            lines.append(f"### {rr.invoice_number or rr.pdf_name}")
+            for d in diffs:
+                lines.append(f"- {d}")
+            lines.append("")
+
+    # --- Section E: Hard failure details ---
     if failures:
         lines += ["", "## Failures (details)", ""]
         for rr in failures:
@@ -595,19 +727,18 @@ def write_markdown_report(path: Path, report: RunReport) -> None:
             for c in rr.checks:
                 mark = "✓" if c.ok else "✗"
                 lines.append(f"- {mark} **{c.name}** — {c.detail}")
+            if rr.arithmetic_warnings:
+                lines.append("- arithmetic warnings:")
+                for w in rr.arithmetic_warnings:
+                    lines.append(f"  - {w}")
             if rr.extraction_diffs:
                 lines.append("- soft diffs:")
                 for d in rr.extraction_diffs:
                     lines.append(f"  - {d}")
-            lines.append("")
-
-    soft = [(rr, rr.extraction_diffs) for rr in report.records.values() if rr.extraction_diffs]
-    if soft:
-        lines += ["", "## Extraction-quality diffs (non-fatal)", ""]
-        for rr, diffs in soft:
-            lines.append(f"### {rr.invoice_number or rr.pdf_name}")
-            for d in diffs:
-                lines.append(f"- {d}")
+            if rr.cli_extract_output:
+                lines.append(f"- CLI extract output: `{rr.cli_extract_output[:400]}`")
+            if rr.cli_import_output:
+                lines.append(f"- CLI import output: `{rr.cli_import_output[:400]}`")
             lines.append("")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -656,11 +787,32 @@ def main() -> int:
             "(default: <pdf-dir>/_faktspense_run/)."
         ),
     )
-    parser.add_argument("--cleanup", action="store_true")
-    parser.add_argument("--skip-extract", action="store_true")
-    parser.add_argument("--skip-import", action="store_true")
-    parser.add_argument("--skip-validate", action="store_true")
-    parser.add_argument("--skip-idempotency", action="store_true")
+    parser.add_argument(
+        "--cleanup", action="store_true", help="Delete created expenses + subjects at the end."
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Pass --verify to faktspense extract (Sonnet second-pass semantic check).",
+    )
+    parser.add_argument(
+        "--skip-extract",
+        action="store_true",
+        help="Skip extraction; reuse sidecars already in work-dir.",
+    )
+    parser.add_argument(
+        "--skip-import",
+        action="store_true",
+        help="Skip import; assume sidecars already have expense_ids.",
+    )
+    parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="Skip GET-back validation of expenses and subjects.",
+    )
+    parser.add_argument(
+        "--skip-idempotency", action="store_true", help="Skip idempotency re-run check."
+    )
     args = parser.parse_args()
 
     _require_env()
@@ -675,7 +827,8 @@ def main() -> int:
     api_log = work_dir / "api.log"
     report_json = work_dir / "report.json"
     report_md = work_dir / "report.md"
-    store = ExportStore(work_dir)
+
+    cli_env = _build_cli_env()
 
     report = RunReport(
         started_at=datetime.now(UTC),
@@ -684,6 +837,7 @@ def main() -> int:
         fakturoid_slug=os.environ[f"{ENV_PREFIX}FAKTUROID_SLUG"],
         args={
             "cleanup": args.cleanup,
+            "verify": args.verify,
             "skip_extract": args.skip_extract,
             "skip_import": args.skip_import,
             "skip_validate": args.skip_validate,
@@ -695,25 +849,37 @@ def main() -> int:
         http = _build_http(log_fh)
         try:
             client = _build_fakturoid(http)
-            if not args.skip_extract:
-                phase_extract(args.pdf_dir, store, report)
-            else:
-                for rec in store.records():
-                    rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
-                    rr.add(CHECK_EXTRACT, True, "skipped (--skip-extract); reusing sidecar")
-                    if rec.fakturoid.status == "imported":
-                        rr.expense_id = rec.fakturoid.expense_id
-                        rr.subject_id = rec.fakturoid.subject_id
-
             subjects = SubjectStore(client=client, cache_path=subjects_cache)
 
+            if not args.skip_extract:
+                store = phase_extract(args.pdf_dir, work_dir, report, cli_env, args.verify)
+            else:
+                store = ExportStore(work_dir)
+                for rec in store.records():
+                    rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
+                    _populate_extraction_data(rr, rec)
+                    rr.add(CHECK_EXTRACT, True, "skipped (--skip-extract); reusing sidecar")
+
             if not args.skip_import:
-                phase_import(store, report, client, subjects)
+                store = phase_import(store, report, subjects, cli_env)
+            else:
+                store = ExportStore(work_dir)
+                for rec in store.records():
+                    rr = _record_report_for(report, rec, Path(rec.source_pdf).name)
+                    _populate_extraction_data(rr, rec)
+                    if rec.fakturoid.status == "imported":
+                        rr.add(
+                            CHECK_EXPENSE_CREATE,
+                            True,
+                            f"skipped (--skip-import); "
+                            f"already imported (expense_id={rr.expense_id})",
+                        )
+
             if not args.skip_validate:
                 phase_validate_expenses(store, report, client)
                 phase_validate_subjects(store, report, client)
             if not args.skip_idempotency:
-                phase_idempotency(store, report, client, subjects)
+                phase_idempotency(store, report, cli_env)
 
             if args.cleanup:
                 phase_cleanup(store, report, client)
