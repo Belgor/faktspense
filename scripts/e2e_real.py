@@ -102,6 +102,7 @@ class Check:
 class RecordReport:
     record_id: str
     pdf_name: str
+    # Extraction data (from sidecar)
     invoice_number: str | None = None
     vendor_name: str | None = None
     vendor_ico: str | None = None
@@ -114,10 +115,13 @@ class RecordReport:
     arithmetic_warnings: list[str] = field(default_factory=list)
     sonnet_ok: bool | None = None
     sonnet_issues: list[str] = field(default_factory=list)
+    # Import state
     expense_id: int | None = None
     subject_id: int | None = None
     subject_was_created: bool = False
+    # Quality
     extraction_diffs: list[str] = field(default_factory=list)
+    # Checks + CLI output
     checks: list[Check] = field(default_factory=list)
     cli_extract_output: str = ""
     cli_import_output: str = ""
@@ -359,6 +363,7 @@ def phase_import(
     result = _run_cli(cmd, cli_env)
     cli_output = (result.stdout + result.stderr).strip()
 
+    # Refresh to discover subjects created by the CLI
     subjects.refresh()
     new_subject_ids = subjects.loaded_subject_ids() - pre_subject_ids
     for sid in sorted(new_subject_ids):
