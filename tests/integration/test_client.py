@@ -28,7 +28,7 @@ def test_retries_on_401_with_token_refetch(
     httpx_mock: HTTPXMock, http_client: httpx.Client
 ) -> None:
     httpx_mock.add_response(
-        url="https://app.fakturoid.cz/oauth/token",
+        url="https://app.fakturoid.cz/api/v3/oauth/token",
         json={"access_token": "fresh", "token_type": "Bearer", "expires_in": 7200},
     )
     httpx_mock.add_response(
@@ -91,7 +91,7 @@ def test_oauth_token_fetch_includes_user_agent(
     httpx_mock: HTTPXMock, http_client: httpx.Client
 ) -> None:
     httpx_mock.add_response(
-        url="https://app.fakturoid.cz/oauth/token",
+        url="https://app.fakturoid.cz/api/v3/oauth/token",
         json={"access_token": "t", "token_type": "Bearer", "expires_in": 7200},
     )
     tp = OAuth2TokenProvider(

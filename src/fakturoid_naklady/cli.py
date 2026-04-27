@@ -15,12 +15,13 @@ from rich.prompt import IntPrompt
 from rich.table import Table
 
 from .export import ExportStore, sha256_file
-from .extraction.claude import ClaudeExtractor
+from .extraction.claude import ClaudeExtractor, SonnetVerifier
 from .extraction.renderer import render_pdf
+from .extraction.validation import arithmetic_validate
 from .fakturoid.auth import OAuth2TokenProvider
 from .fakturoid.client import USER_AGENT, FakturoidClient
 from .fakturoid.subjects import SubjectStore
-from .models import ExportRecord, VendorInfo
+from .models import ExportRecord, FakturoidStatus, VendorInfo
 from .pipeline import (
     AlreadyImportedError,
     ImportFlags,
@@ -78,6 +79,14 @@ def _build_extractor() -> ClaudeExtractor:
     return ClaudeExtractor(client=anth)
 
 
+def _build_verifier() -> SonnetVerifier:
+    import anthropic  # lazy import
+
+    _require_env("ANTHROPIC_API_KEY")
+    anth = anthropic.Anthropic()
+    return SonnetVerifier(client=anth)
+
+
 def _vendor_prompt(
     vendor: VendorInfo, candidates: list[dict[str, Any]]
 ) -> tuple[VendorPromptAction, dict[str, Any] | None]:
@@ -111,6 +120,9 @@ def extract(
     output: Path = typer.Option(
         Path("export"), "--output", "-o", help="Directory for per-invoice JSON sidecars."
     ),
+    verify: bool = typer.Option(
+        False, "--verify", help="Run Sonnet second-pass semantic verification after extraction."
+    ),
 ) -> None:
     """Extract invoice data from PDF(s); writes one JSON sidecar per PDF into ``output``."""
     pdfs = _iter_pdfs(input_path)
@@ -119,6 +131,7 @@ def extract(
         raise typer.Exit(code=1)
 
     extractor = _build_extractor()
+    verifier = _build_verifier() if verify else None
     store = ExportStore(output)
 
     for pdf in pdfs:
@@ -134,13 +147,43 @@ def extract(
         console.print(f"[cyan]extract[/cyan] {pdf.name}")
         rendered = render_pdf(pdf)
         extracted = extractor.extract(rendered)
+
+        # Pass 1: arithmetic cross-check
+        arith_warning = arithmetic_validate(extracted)
+        warnings = [arith_warning] if arith_warning else []
+
+        # Pass 2: Sonnet semantic verification
+        sonnet_verdict = None
+        if verifier is not None:
+            console.print("  [dim]verifying with Sonnet...[/dim]")
+            sonnet_verdict = verifier.verify(rendered, extracted)
+
+        new_status = (
+            "needs_review" if (sonnet_verdict is not None and not sonnet_verdict.ok) else "pending"
+        )
+
         record = ExportRecord.from_extraction(
             invoice_id=invoice_id,
             source_pdf=str(pdf.resolve()),
             extracted_at=datetime.now(UTC),
             extracted=extracted,
         )
+        record = record.model_copy(
+            update={
+                "fakturoid": FakturoidStatus(
+                    status=new_status,
+                    warnings=warnings,
+                    sonnet_verdict=sonnet_verdict,
+                )
+            }
+        )
         store.upsert(record)
+
+        if arith_warning:
+            console.print(f"  [yellow]⚠  arithmetic:[/yellow] {arith_warning.message}")
+        if sonnet_verdict and not sonnet_verdict.ok:
+            for issue in sonnet_verdict.issues:
+                console.print(f"  [red]✗  semantic:[/red] {issue}")
 
     console.print(f"[green]wrote[/green] {output}")
 
@@ -154,6 +197,9 @@ def import_cmd(
     auto_create_subjects: bool = typer.Option(False, "--auto-create-subjects"),
     no_create: bool = typer.Option(False, "--no-create"),
     refresh_subjects: bool = typer.Option(False, "--refresh-subjects"),
+    force_review: bool = typer.Option(
+        False, "--force-review", help="Import invoices flagged needs_review without blocking."
+    ),
 ) -> None:
     """Import pending invoices from the sidecar directory into Fakturoid."""
     if auto_create_subjects and no_create:
@@ -182,11 +228,18 @@ def import_cmd(
             auto_create_subjects=auto_create_subjects,
             no_create=no_create,
             refresh_subjects=refresh_subjects,
+            force_review=force_review,
         )
 
         for record in records:
             if record.fakturoid.status == "imported":
                 console.print(f"[yellow]skip[/yellow] {record.invoice_number} — already imported")
+                continue
+            if record.fakturoid.status == "needs_review" and not force_review:
+                console.print(
+                    f"[yellow]skip[/yellow] {record.invoice_number} — needs review "
+                    "(use --force-review to import anyway)"
+                )
                 continue
             try:
                 outcome = runner.run_one(record, flags)
@@ -197,6 +250,9 @@ def import_cmd(
             except Exception as e:
                 store.update_status(record.id, status="error", error=str(e))
                 raise
+
+            if outcome.status == "needs_review":
+                continue
 
             store.update_status(
                 record.id,

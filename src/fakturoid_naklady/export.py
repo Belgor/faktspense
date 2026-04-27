@@ -98,6 +98,8 @@ class ExportStore:
             imported_at=imported_at if imported_at is not None else rec.fakturoid.imported_at,
             status=status,
             error=error,
+            warnings=rec.fakturoid.warnings,
+            sonnet_verdict=rec.fakturoid.sonnet_verdict,
         )
         self._write_sidecar(rec)
         return rec

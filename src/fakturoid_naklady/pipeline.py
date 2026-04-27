@@ -30,6 +30,7 @@ class ImportFlags:
     auto_create_subjects: bool = False
     no_create: bool = False
     refresh_subjects: bool = False
+    force_review: bool = False
 
 
 class VendorPrompt(Protocol):
@@ -77,6 +78,14 @@ class ImportRunner:
                 f"Record {record.id!r} already imported "
                 f"(expense_id={record.fakturoid.expense_id}, "
                 f"imported_at={record.fakturoid.imported_at})"
+            )
+
+        if record.fakturoid.status == "needs_review" and not flags.force_review:
+            return ImportOutcome(
+                status="needs_review",
+                subject_id=None,
+                expense_id=None,
+                imported_at=None,
             )
 
         if flags.refresh_subjects:

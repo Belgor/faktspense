@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-FakturoidStatusValue = Literal["pending", "imported", "error", "skipped"]
+FakturoidStatusValue = Literal["pending", "imported", "error", "skipped", "needs_review"]
 
 
 def normalize_ico(v: object) -> str | None:
@@ -57,6 +57,22 @@ class InvoiceLine(BaseModel):
         return v
 
 
+class ValidationWarning(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+    computed: Decimal | None = None
+    extracted: Decimal | None = None
+
+
+class SonnetVerdict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ok: bool
+    issues: list[str] = Field(default_factory=list)
+
+
 class FakturoidStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,6 +81,8 @@ class FakturoidStatus(BaseModel):
     imported_at: datetime | None = None
     status: FakturoidStatusValue = "pending"
     error: str | None = None
+    warnings: list[ValidationWarning] = Field(default_factory=list)
+    sonnet_verdict: SonnetVerdict | None = None
 
 
 class ExtractedInvoice(BaseModel):

@@ -92,7 +92,7 @@ def test_import_dry_run_does_not_post(
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
 
     httpx_mock.add_response(
-        url="https://app.fakturoid.cz/oauth/token",
+        url="https://app.fakturoid.cz/api/v3/oauth/token",
         json={"access_token": "t", "token_type": "Bearer", "expires_in": 7200},
     )
     httpx_mock.add_response(
@@ -128,7 +128,7 @@ def test_import_live_then_blocks_reimport(
     runner.invoke(app, ["extract", str(sample_pdf), "--output", str(out)])
 
     httpx_mock.add_response(
-        url="https://app.fakturoid.cz/oauth/token",
+        url="https://app.fakturoid.cz/api/v3/oauth/token",
         json={"access_token": "t", "token_type": "Bearer", "expires_in": 7200},
         is_reusable=True,
     )

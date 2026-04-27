@@ -53,7 +53,7 @@ def test_build_expense_payload_matches_golden() -> None:
     )
     assert payload["custom_id"] == rec.id
     assert payload["subject_id"] == 7
-    assert payload["number"] == "2024-0042"
+    assert payload["original_number"] == "2024-0042"
     assert payload["issued_on"] == "2024-03-15"
     assert payload["due_on"] == "2024-03-29"
     assert payload["taxable_fulfillment_due"] == "2024-03-15"
@@ -65,7 +65,7 @@ def test_build_expense_payload_matches_golden() -> None:
     att = payload["attachments"][0]
     assert att["filename"] == "acme.pdf"
     expected = "data:application/pdf;base64," + base64.b64encode(b"PDFBYTES").decode()
-    assert att["download_url"] == expected
+    assert att["data_url"] == expected
 
 
 def test_build_expense_payload_requires_id() -> None:
@@ -94,4 +94,4 @@ def test_create_expense_posts_and_returns_response(tmp_path: Path, httpx_mock: H
     body = json.loads(req.content)
     assert body["subject_id"] == 7
     assert body["attachments"][0]["filename"] == "acme.pdf"
-    assert body["attachments"][0]["download_url"].startswith("data:application/pdf;base64,")
+    assert body["attachments"][0]["data_url"].startswith("data:application/pdf;base64,")
